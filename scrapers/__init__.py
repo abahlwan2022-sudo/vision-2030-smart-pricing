@@ -1,1 +1,2 @@
-# scrapers package — محرك الكشط غير المتزامن
+# scrapers package
+# intentionally empty to flush legacy imports
