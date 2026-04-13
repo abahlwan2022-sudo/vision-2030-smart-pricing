@@ -1,12 +1,9 @@
 """
 engines/async_scraper.py — محرك الكشط الرئيسي v2.0 (MASTER)
 ═══════════════════════════════════════════════════════════════
+✅ توافق تام مع StealthManager و SitemapResolver
 ✅ نقاط استئناف ذكية (Checkpointing) لكل منافس على حدة
-✅ استئناف تلقائي من آخر نقطة توقف عند الانقطاع
-✅ كشط مفرد لأي منافس بشكل مستقل (run_single_store)
-✅ دعم كامل للـ CLI (--store / --resume / --reset-state)
-✅ شيمات scrapers/ و utils/ و make/ تستورد منه تلقائياً
-✅ (مُحدّث) حماية الذاكرة، تسريع الـ Regex، و Connection Pooling
+✅ حماية الذاكرة وتسريع الـ Regex
 """
 from __future__ import annotations
 
@@ -18,6 +15,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +24,13 @@ from urllib.parse import urlparse
 
 import aiohttp
 import pandas as pd
+
+if os.name == "nt":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # ─── قفل مزامنة مشترك لحماية ملفات الحالة من Race Conditions ────────────────
 _STATE_WRITE_LOCK    = threading.Lock()
@@ -42,7 +47,6 @@ logger = logging.getLogger("AsyncScraper")
 
 # ─── ثوابت مُترجمة مسبقاً (Precompiled Regex) لحماية الذاكرة ────────────────
 import re as _re
-import concurrent.futures as _futures
 
 _RE_OG_TITLE    = _re.compile(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', _re.I)
 _RE_OG_IMAGE    = _re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', _re.I)
@@ -53,20 +57,11 @@ _RE_H1_PRODUCT  = _re.compile(r'<h1[^>]*>\s*([^<]{3,120}?)\s*</h1>', _re.S | _re
 
 # ─── Anti-ban imports مُسبقة على مستوى الـ Module ─────────────────────────
 try:
-    from scrapers.anti_ban import get_browser_headers as _get_browser_headers
-    from scrapers.anti_ban import try_all_sync_fallbacks as _try_all_sync_fallbacks
+    from scrapers.anti_ban import stealth_manager, fetch_with_retry
     _ANTI_BAN_AVAILABLE = True
 except ImportError:
     _ANTI_BAN_AVAILABLE = False
     logger.warning("⚠️ scrapers.anti_ban غير متاح — سيتم استخدام headers افتراضية")
-    _get_browser_headers      = lambda url: {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    _try_all_sync_fallbacks   = lambda url, timeout=25: None
-
-# ─── ThreadPoolExecutor مخصص للـ fallback المزامن ─────────────────────────
-_FALLBACK_EXECUTOR = _futures.ThreadPoolExecutor(
-    max_workers=16,
-    thread_name_prefix="scraper_fallback",
-)
 
 # ─── مسارات البيانات ──────────────────────────────────────────────────────────
 _DATA_DIR = os.environ.get("DATA_DIR", "data")
@@ -111,7 +106,7 @@ class Progress:
     store_urls_total: int = 0
     last_error: str = ""
     stores_results: Dict[str, int] = field(default_factory=dict)
-    stores_http_errors: Dict[str, dict] = field(default_factory=dict) # ✅ تمت الإضافة للحماية من الانهيار
+    stores_http_errors: Dict[str, dict] = field(default_factory=dict)
 
     def save(self, path: str = PROGRESS_FILE) -> None:
         try:
@@ -120,8 +115,8 @@ class Progress:
             with _PROGRESS_WRITE_LOCK:
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(asdict(self), f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"تعذّر حفظ التقدم: {e}")
+        except Exception:
+            logger.warning(f"تعذّر حفظ التقدم: {traceback.format_exc()}")
 
     @classmethod
     def load(cls, path: str = PROGRESS_FILE) -> "Progress":
@@ -136,16 +131,16 @@ def _write_pid_file() -> None:
     try:
         with open(PID_FILE, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
-    except Exception as e:
-        logger.warning(f"تعذّر حفظ PID: {e}")
+    except Exception:
+        logger.warning(f"تعذّر حفظ PID: {traceback.format_exc()}")
 
 
 def _cleanup_pid_file() -> None:
     try:
         if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
-    except Exception as e:
-        logger.warning(f"تعذّر حذف PID file: {e}")
+    except Exception:
+        logger.warning(f"تعذّر حذف PID file: {traceback.format_exc()}")
 
 
 def _mark_progress_failed(message: str) -> None:
@@ -156,8 +151,8 @@ def _mark_progress_failed(message: str) -> None:
         progress.finished_at = datetime.now().isoformat()
         progress.last_error = (message or "")[:300]
         progress.save()
-    except Exception as e:
-        logger.warning(f"تعذّر تحديث حالة الفشل: {e}")
+    except Exception:
+        logger.warning(f"تعذّر تحديث حالة الفشل: {traceback.format_exc()}")
 
 
 @dataclass
@@ -178,17 +173,11 @@ class StoreCheckpoint:
 
 
 class ScraperState:
-    """
-    نظام نقاط الاستئناف الكامل.
-    يقرأ/يكتب scraper_state.json ويحتفظ بحالة كل متجر.
-    """
-
+    """نظام نقاط الاستئناف الكامل."""
     def __init__(self, path: str = STATE_FILE):
         self._path = path
         self._data: Dict[str, StoreCheckpoint] = {}
         self._load()
-
-    # ── قراءة / كتابة ────────────────────────────────────────────────────────
 
     def _load(self) -> None:
         try:
@@ -208,10 +197,8 @@ class ScraperState:
             with _STATE_WRITE_LOCK:
                 with open(self._path, "w", encoding="utf-8") as f:
                     json.dump(out, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"تعذّر حفظ الحالة: {e}")
-
-    # ── واجهة المستخدم ───────────────────────────────────────────────────────
+        except Exception:
+            logger.warning(f"تعذّر حفظ الحالة: {traceback.format_exc()}")
 
     def get(self, domain: str, store_url: str) -> StoreCheckpoint:
         if domain not in self._data:
@@ -242,7 +229,6 @@ class ScraperState:
         return self._data.get(domain, StoreCheckpoint("", "")).status == "done"
 
     def reset(self, domain: str | None = None) -> None:
-        """إعادة تعيين متجر واحد أو الكل"""
         if domain:
             if domain in self._data:
                 cp = self._data[domain]
@@ -273,9 +259,7 @@ class ScraperState:
 def _domain(url: str) -> str:
     return urlparse(url).netloc.replace("www.", "")
 
-
 def _write_live_progress(domain: str, data: dict) -> None:
-    """يكتب ملف تقدم حي خاص بالمتجر — يُقرأ من واجهة Streamlit."""
     try:
         with _LIVE_WRITE_LOCK:
             with open(os.path.join(_DATA_DIR, f"_sc_live_{domain}.json"), "w", encoding="utf-8") as f:
@@ -283,12 +267,7 @@ def _write_live_progress(domain: str, data: dict) -> None:
     except Exception:
         pass
 
-
 def extract_product(data: dict, store_url: str) -> dict | None:
-    """
-    يُحوّل بيانات منتج خام إلى صف موحّد بـ CSV_COLS.
-    يدعم: Shopify / Salla / Zid / WooCommerce / HTML meta
-    """
     name = (
         data.get("name") or data.get("title") or
         data.get("product_name") or data.get("الاسم") or ""
@@ -341,25 +320,15 @@ def extract_product(data: dict, store_url: str) -> dict | None:
 
 
 def _url_looks_like_product_page(url: str) -> bool:
-    """
-    يمنح og:title / h1 معنى «منتج» فقط على مسارات تبدو صفحة منتج،
-    حتى لا يُسجَّل اسم المتجر من Organization كمنتج على كل الصفحات.
-    """
-    try:
-        from engines.sitemap_resolve import _is_product_url, _is_salla_product
-
-        return bool(_is_salla_product(url) or _is_product_url(url))
-    except Exception:
-        p = (urlparse(url).path or "").lower()
-        return bool(
-            _re.search(r"/p\d{5,}(?:/|\?|$)", p)
-            or "/products/" in p
-            or "/product/" in p
-        )
+    p = (urlparse(url).path or "").lower()
+    return bool(
+        _re.search(r"/p\d{5,}(?:/|\?|$)", p)
+        or "/products/" in p
+        or "/product/" in p
+    )
 
 
 def _product_fields_from_all_json_ld(html: str) -> dict:
-    """يجمع حقول Product من كل بلوكات JSON-LD (@graph، قوائم، …)."""
     try:
         from utils.competitor_product_scraper import _walk_json_ld
     except Exception:
@@ -382,33 +351,8 @@ def _product_fields_from_all_json_ld(html: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  جلب منتج واحد من URL
+#  جلب منتج واحد من URL مع حماية Stealth
 # ══════════════════════════════════════════════════════════════════════════════
-
-def _sync_fetch_fallback(url: str, timeout: int = 25) -> str | None:
-    """
-    سلسلة الـ fallback المزامنة لتخطي الحماية (تُستدعى من ThreadPoolExecutor):
-    1. curl_cffi  → TLS Impersonation (أقوى ضد Cloudflare)
-    2. cloudscraper → JS Challenge bypass
-    3. requests   → طلب عادي بـ headers محاكية
-    """
-    if not _ANTI_BAN_AVAILABLE:
-        return None
-
-    try:
-        result = _try_all_sync_fallbacks(url, timeout=timeout)
-        return result
-    except TypeError:
-        # إذا كانت try_all_sync_fallbacks لا تقبل timeout بعد
-        try:
-            return _try_all_sync_fallbacks(url)
-        except Exception as exc:
-            logger.debug("_sync_fetch_fallback (no-timeout variant) فشل: %s — %s", url, exc)
-            return None
-    except Exception as exc:
-        logger.debug("_sync_fetch_fallback فشل: %s — %s", url, exc)
-        return None
-
 
 async def fetch_product(
     session: aiohttp.ClientSession,
@@ -417,76 +361,107 @@ async def fetch_product(
     semaphore: asyncio.Semaphore,
     http_status_counters: Dict[str, int] | None = None,
 ) -> dict | None:
-    """
-    يجلب صفحة/API منتج ويُعيد dict موحّد أو None.
-    """
     async with semaphore:
-        # ── Shopify-style .json ──────────────────────────────────────────
         json_url = url if url.endswith(".json") else url.rstrip("/") + ".json"
-        proxy = _get_browser_headers.__globals__.get("get_proxy")() if _ANTI_BAN_AVAILABLE else None
+        
+        # تطبيق تأخير بسيط جداً داخل كل سレッド لمنع الـ Spike Requests
+        if _ANTI_BAN_AVAILABLE:
+            await stealth_manager.apply_smart_delay(0.5, 1.5)
+            
         try:
-            async with session.get(
-                json_url, timeout=aiohttp.ClientTimeout(total=12), ssl=False,
-                proxy=proxy
-            ) as resp:
-                if resp.status == 200 and "json" in resp.headers.get("Content-Type", ""):
-                    data = await resp.json(content_type=None)
-                    prod = data.get("product", data)
-                    row  = extract_product(prod, store_url)
-                    if row:
-                        return row
-                elif resp.status in (403, 429) and http_status_counters is not None:
-                    http_status_counters[str(resp.status)] = (
-                        http_status_counters.get(str(resp.status), 0) + 1
-                    )
-        except Exception:
-            pass
-
-        # ── HTML fallback ────────────────────────────────────────────────
-        hdrs = _get_browser_headers(store_url)
-
-        html: str | None = None
-        loop = asyncio.get_running_loop()
-
-        # محاولة aiohttp عادية
-        try:
-            async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=18),
-                headers=hdrs, ssl=False, allow_redirects=True,
-                proxy=proxy
-            ) as resp:
-                if resp.status == 200:
-                    html = await resp.text(errors="replace")
-                elif resp.status in (403, 429, 503):
-                    if resp.status in (403, 429) and http_status_counters is not None:
+            if _ANTI_BAN_AVAILABLE:
+                resp = await fetch_with_retry(session, json_url, max_retries=2, referer=store_url)
+                if resp is not None:
+                    try:
+                        if resp.status == 200 and "json" in resp.headers.get("Content-Type", ""):
+                            data = await resp.json(content_type=None)
+                            prod = data.get("product", data)
+                            row  = extract_product(prod, store_url)
+                            if row:
+                                return row
+                        elif resp.status in (403, 429) and http_status_counters is not None:
+                            http_status_counters[str(resp.status)] = (
+                                http_status_counters.get(str(resp.status), 0) + 1
+                            )
+                    finally:
+                        resp.close()
+            else:
+                async with session.get(
+                    json_url, timeout=aiohttp.ClientTimeout(total=12), ssl=False
+                ) as resp:
+                    if resp.status == 200 and "json" in resp.headers.get("Content-Type", ""):
+                        data = await resp.json(content_type=None)
+                        prod = data.get("product", data)
+                        row  = extract_product(prod, store_url)
+                        if row:
+                            return row
+                    elif resp.status in (403, 429) and http_status_counters is not None:
                         http_status_counters[str(resp.status)] = (
                             http_status_counters.get(str(resp.status), 0) + 1
                         )
-                    logger.debug("HTTP %d — جرب curl_cffi: %s", resp.status, url)
-                    try:
-                        html = await asyncio.wait_for(
-                            loop.run_in_executor(_FALLBACK_EXECUTOR, _sync_fetch_fallback, url),
-                            timeout=35.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.debug("Fallback timeout (35s): %s", url)
-                        html = None
         except Exception:
+            pass
+
+        # ── HTML Fetch بأسلوب التخفي ──────────────────────────────────────
+        if _ANTI_BAN_AVAILABLE:
+            hdrs = stealth_manager.get_secure_headers(referer=store_url)
+        else:
+            hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+        html: str | None = None
+
+        try:
+            if _ANTI_BAN_AVAILABLE:
+                resp = await fetch_with_retry(session, url, max_retries=3, referer=store_url)
+                if resp is not None:
+                    try:
+                        if resp.status == 200:
+                            html = await resp.text(errors="replace")
+                            is_banned, ban_msg = stealth_manager.is_shadow_banned(html, resp.status)
+                            if is_banned:
+                                logger.error(f"[Anti-Ban] Shadow ban during fetch on {url}: {ban_msg}")
+                                html = None
+                        elif resp.status in (403, 429, 503):
+                            if http_status_counters is not None:
+                                http_status_counters[str(resp.status)] = (
+                                    http_status_counters.get(str(resp.status), 0) + 1
+                                )
+                            logger.debug(f"HTTP {resp.status} Blocked: {url}")
+                    finally:
+                        resp.close()
+            else:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=20),
+                    headers=hdrs, ssl=False, allow_redirects=True,
+                ) as resp:
+                    if resp.status == 200:
+                        html = await resp.text(errors="replace")
+                    elif resp.status in (403, 429, 503):
+                        if http_status_counters is not None:
+                            http_status_counters[str(resp.status)] = (
+                                http_status_counters.get(str(resp.status), 0) + 1
+                            )
+                        logger.debug(f"HTTP {resp.status} Blocked: {url}")
+        except Exception:
+            logger.debug(f"Fetch failed for {url}: {traceback.format_exc()}")
+            html = None
+
+        # في حال الحظر/الفشل، جرّب Fallback متزامن (curl_cffi/cloudscraper/requests)
+        if not html and _ANTI_BAN_AVAILABLE:
             try:
-                html = await asyncio.wait_for(
-                    loop.run_in_executor(_FALLBACK_EXECUTOR, _sync_fetch_fallback, url),
-                    timeout=35.0,
+                from scrapers.anti_ban import try_all_sync_fallbacks
+                loop = asyncio.get_running_loop()
+                html = await loop.run_in_executor(
+                    None,
+                    lambda: try_all_sync_fallbacks(url, timeout=25),
                 )
-            except asyncio.TimeoutError:
-                logger.debug("Fallback timeout (35s) after exception: %s", url)
-                html = None
             except Exception:
                 html = None
 
         if not html:
             return None
 
-        # ── JSON-LD + meta (كل البلوكات — سلة وShopify وغيرها) ───────────
+        # ── JSON-LD + meta ───────────────────────────────────────────────
         try:
             from utils.competitor_product_scraper import extract_meta_bundle
 
@@ -516,7 +491,7 @@ async def fetch_product(
                 if row:
                     return row
         except Exception as exc:
-            logger.debug("extract_meta_bundle: %s — %s", url, exc)
+            pass
 
         ld_acc = _product_fields_from_all_json_ld(html)
         if ld_acc.get("name"):
@@ -540,7 +515,7 @@ async def fetch_product(
             if row:
                 return row
 
-        # ── og:meta + h1 (احتياط عند فشل المسارات أعلاه) ─────────────────
+        # ── og:meta + h1 ───────────────────────────────────────────────────
         def _meta(pattern: _re.Pattern) -> str:
             m = pattern.search(html)
             return m.group(1).strip() if m else ""
@@ -573,6 +548,26 @@ async def fetch_product(
                 store_url,
             )
 
+        # AI fallback: محاولة استخراج ذكي عندما تفشل كل الطرق التقليدية
+        try:
+            from engines.ai_engine import ai_fallback_scrape
+            ai_data = ai_fallback_scrape(html, url) if html else {}
+            if isinstance(ai_data, dict) and not ai_data.get("error"):
+                row = extract_product(
+                    {
+                        "name": ai_data.get("name", ""),
+                        "price": ai_data.get("price", 0),
+                        "url": url,
+                        "image": "",
+                        "brand": "",
+                    },
+                    store_url,
+                )
+                if row:
+                    return row
+        except Exception:
+            pass
+
         return None
 
 
@@ -592,7 +587,10 @@ async def scrape_one_store(
     domain = _domain(store_url)
     cp     = state.get(domain, store_url)
 
-    if resume and cp.status == "done" and not single_mode:
+    # Architectural Fix: NEVER skip if max_products is explicitly requested or in single UI mode
+    _force_run = (max_products > 0) or single_mode
+    
+    if resume and cp.status == "done" and not _force_run:
         logger.info(f"⏭️ {domain} — مكتمل ({cp.rows_saved} منتج)")
         return []
 
@@ -601,23 +599,20 @@ async def scrape_one_store(
     state.save()
 
     try:
-        from engines.sitemap_resolve import resolve_store_product_urls
+        from scrapers.sitemap_resolve import sitemap_resolver
     except ImportError:
-        try:
-            from scrapers.sitemap_resolve import resolve_store_product_urls
-        except ImportError:
-            logger.error("تعذّر تحميل sitemap_resolve")
-            state.mark_error(domain, "import_error")
-            return []
+        logger.error("تعذّر تحميل sitemap_resolve")
+        state.mark_error(domain, "import_error")
+        return []
 
-    connector = aiohttp.TCPConnector(ssl=False, limit=concurrency + 5)
+    connector = aiohttp.TCPConnector(ssl=False, limit=max(100, concurrency * 5))
     session: aiohttp.ClientSession | None = None
 
     try:
         session = aiohttp.ClientSession(
             connector=connector,
             connector_owner=True,
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=15),
         )
 
         progress.current_store    = domain
@@ -625,36 +620,34 @@ async def scrape_one_store(
         progress.store_urls_total = 0
         progress.save()
 
-        logger.info(f"🗺️ {domain} — يحلل Sitemap…")
+        logger.info(f"🗺️ {domain} — يحلل Sitemap بالتخفي العميق…")
         try:
-            entries = await asyncio.wait_for(
-                resolve_store_product_urls(session, store_url), timeout=300
+            all_urls = await asyncio.wait_for(
+                sitemap_resolver.resolve(store_url), timeout=400
             )
         except asyncio.TimeoutError:
             state.mark_error(domain, "sitemap_timeout")
             return []
-        except Exception as e:
-            state.mark_error(domain, str(e)[:150])
+        except Exception:
+            state.mark_error(domain, traceback.format_exc()[:150])
             return []
 
-        if not entries:
+        if not all_urls:
             logger.warning(f"⚠️ {domain} — لا روابط في Sitemap")
             state.mark_error(domain, "empty_sitemap")
             return []
 
-        all_urls = [e.url for e in entries]
-        total    = len(all_urls)
-        if max_products and max_products < total:
-            all_urls = all_urls[:max_products]
-            total    = len(all_urls)
-
-        resume_idx = cp.last_url_index if (resume and cp.last_url_index > 0) else 0
+        total = len(all_urls)
+        
+        # Reset checkpoint if forced run
+        resume_idx = 0 if _force_run else (cp.last_url_index if (resume and cp.last_url_index > 0) else 0)
+        
         if resume_idx > 0:
             logger.info(f"🔄 {domain} — استئناف من الرابط {resume_idx}/{total}")
         pending_urls = all_urls[resume_idx:]
 
         state.update(domain, urls_total=total, urls_done=resume_idx)
-        progress.urls_total       += total
+        progress.urls_total        += total
         progress.store_urls_total  = total
 
         semaphore         = asyncio.Semaphore(concurrency)
@@ -663,7 +656,7 @@ async def scrape_one_store(
         checkpoint_every  = max(50, min(200, total // 10 + 1))
         store_http_status = {"403": 0, "429": 0}
 
-        _TASK_TIMEOUT = 60.0
+        _TASK_TIMEOUT = 45.0
 
         async def _fetch_one(url: str) -> None:
             nonlocal done_count
@@ -683,9 +676,9 @@ async def scrape_one_store(
             except asyncio.TimeoutError:
                 logger.debug("URL timeout (%ss): %s", _TASK_TIMEOUT, url)
                 progress.fetch_exceptions += 1
-            except Exception as e:
+            except Exception:
                 progress.fetch_exceptions += 1
-                progress.last_error = str(e)[:100]
+                progress.last_error = traceback.format_exc()[:100]
             finally:
                 done_count += 1
                 progress.urls_processed  += 1
@@ -705,7 +698,7 @@ async def scrape_one_store(
                         "updated_at": datetime.now().isoformat()[:19],
                     })
 
-                if done_count % checkpoint_every == 0:
+                if done_count % checkpoint_every == 0 and not _force_run:
                     state.update(
                         domain,
                         last_url_index=done_count,
@@ -716,14 +709,17 @@ async def scrape_one_store(
                     )
 
         BATCH = 50
-        _batch_new_rows: List[dict] = []  # مخزن مؤقت للكتابة الفورية إلى SQLite
-
         for start in range(0, len(pending_urls), BATCH):
+            if max_products > 0 and len(rows) >= max_products:
+                logger.info(f"🛑 {domain} — تم الوصول للحد الأقصى ({max_products}). جاري إيقاف السحب.")
+                rows = rows[:max_products]
+                break
+
             batch = pending_urls[start: start + BATCH]
             _pre_count = len(rows)
+            
             await asyncio.gather(*[_fetch_one(u) for u in batch], return_exceptions=True)
 
-            # ── كتابة فورية لكل منتج جديد إلى SQLite (Real-time) ──────────
             _new_in_batch = rows[_pre_count:]
             if _new_in_batch:
                 try:
@@ -742,18 +738,19 @@ async def scrape_one_store(
                 except Exception as _db_exc:
                     logger.debug("SQLite real-time write error: %s", _db_exc)
 
-            total_blocks = int(store_http_status.get("403", 0)) + int(store_http_status.get("429", 0))
-            processed_so_far = start + len(batch)
-            block_rate = total_blocks / max(processed_so_far, 1)
+            recent_blocks = int(store_http_status.get("403", 0)) + int(store_http_status.get("429", 0))
+            recent_processed = start + len(batch)
+            block_rate = recent_blocks / max(recent_processed, 1)
 
             if block_rate > 0.3:
-                adaptive_delay = 4.0
+                adaptive_delay = 5.0
+                logger.warning(f"[Anti-Ban] حظر عالي ({block_rate:.2f}). تبريد {adaptive_delay} ثوانِ")
             elif block_rate > 0.1:
                 adaptive_delay = 2.0
             else:
                 adaptive_delay = 0.5
 
-            if start + BATCH < len(pending_urls):
+            if start + BATCH < len(pending_urls) and (max_products == 0 or len(rows) < max_products):
                 await asyncio.sleep(adaptive_delay)
 
     finally:
@@ -761,7 +758,9 @@ async def scrape_one_store(
             await session.close()
         await asyncio.sleep(0.25)
 
-    state.mark_done(domain, len(rows))
+    if not _force_run:
+        state.mark_done(domain, len(rows))
+    
     progress.stores_http_errors[domain] = {
         "403": int(store_http_status.get("403", 0)),
         "429": int(store_http_status.get("429", 0)),
@@ -783,8 +782,9 @@ def run_single_store(
 ) -> dict:
     domain = _domain(store_url)
     state  = ScraperState()
-    if force:
-        state.reset(domain)
+    
+    # Always reset state for single store runs to avoid stale 'done' skips
+    state.reset(domain)
 
     progress = Progress(
         running=True,
@@ -805,18 +805,18 @@ def run_single_store(
                 store_url, progress, state,
                 concurrency=concurrency,
                 max_products=max_products,
-                resume=not force,
+                resume=False, # Architectural Fix: Force fetch for UI requests
                 single_mode=True,
             )
         )
-    except Exception as e:
+    except Exception:
         progress.running = False
         progress.phase = "failed"
         progress.finished_at = datetime.now().isoformat()
-        progress.last_error = str(e)[:300]
+        progress.last_error = traceback.format_exc()[:300]
         progress.save()
-        state.mark_error(domain, str(e))
-        return {"success": False, "rows": 0, "message": str(e), "domain": domain}
+        state.mark_error(domain, traceback.format_exc())
+        return {"success": False, "rows": 0, "message": traceback.format_exc(), "domain": domain}
     finally:
         try:
             loop.close()
@@ -887,6 +887,14 @@ async def run_scraper(
         return
 
     state    = ScraperState()
+    
+    # Architectural Fix: If max_products is set, we must force a fresh scrape
+    _effective_resume = resume and (max_products == 0)
+    
+    if not _effective_resume:
+        logger.info("🗑️ تم تعطيل الاستئناف لإجبار جلب البيانات الجديدة (تحديث محدود/مُجبر)")
+        state.reset()
+
     progress = Progress(
         running=True,
         started_at=datetime.now().isoformat(),
@@ -907,7 +915,7 @@ async def run_scraper(
             store_url, progress, state,
             concurrency=concurrency,
             max_products=max_products,
-            resume=resume,
+            resume=_effective_resume,
         )
 
         progress.stores_done = i
@@ -972,8 +980,8 @@ def main():
                     resume=resume,
                 )
             )
-    except Exception as e:
-        _mark_progress_failed(str(e))
+    except Exception:
+        _mark_progress_failed(traceback.format_exc())
         raise
     finally:
         _cleanup_pid_file()

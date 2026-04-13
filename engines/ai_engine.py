@@ -10,10 +10,16 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 ✅ تصنيف تلقائي لقسم "تحت المراجعة"
 ✅ v26.0: بحث أشمل في المتاجر السعودية مع تحليل JSON دقيق
 """
+import os
 import requests, json, re, time, traceback, random
 from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+try:
+    import streamlit as st
+except Exception:
+    st = None
 from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
 
 _GM  = "gemini-2.0-flash"  # ← النموذج المستقر الموصى به
@@ -501,6 +507,55 @@ def _search_ddg(query, num_results=5):
     except: pass
     return []
 
+
+def ai_fallback_scrape(html_content: str, url: str) -> dict:
+    # مسار AI مخصص للكشط: يعتمد مفاتيح config (Railway env) فقط
+    try:
+        if not GEMINI_API_KEYS:
+            return {"error": "Missing Gemini keys in environment"}
+
+        # 1) تنظيف HTML لتقليل التكلفة وتسريع الاستجابة
+        soup = BeautifulSoup(html_content, "html.parser")
+        for script in soup(["script", "style", "nav", "footer", "header", "svg", "noscript"]):
+            script.decompose()
+
+        clean_text = " ".join(soup.stripped_strings)[:5000]
+
+        # 2) توجيه صارم لإرجاع JSON فقط
+        prompt = f"""
+        أنت خبير كشط بيانات وخبير عطور عالمي. استخرج بيانات المنتج من النص التالي المسحوب من: {url}
+        أرجع ردك كـ JSON فقط بالصيغة التالية بدون أي نصوص إضافية، وتأكد أن السعر رقم (Float) فقط:
+        {{
+            "name": "اسم المنتج",
+            "price": 150.50,
+            "is_available": true,
+            "description": "وصف مختصر وجذاب للمنتج",
+            "fragrance_notes": "إفتتاحية العطر: كذا. قلب العطر: كذا. قاعدة العطر: كذا."
+        }}
+        تعليمات هامة جداً:
+        1. إذا كان المنتج عطراً، قم بجلب "المكونات العطرية" (fragrance_notes) الدقيقة له من قاعدة بياناتك ومعرفتك الموثوقة بالعطور العالمية، حتى لو لم تُذكر في النص المرفق! يجب أن تكون دقيقة وموثوقة.
+        2. النص: {clean_text}
+        """
+
+        response_text = _call_gemini(
+            prompt,
+            system="أرجع JSON فقط بدون شرح.",
+            grounding=False,
+            temperature=0.2,
+            max_tokens=1024,
+        )
+        if not response_text:
+            return {"error": "Gemini returned empty response"}
+
+        # 3) استخراج JSON بأمان حتى مع أي نص إضافي
+        match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return {"error": "Failed to parse JSON output"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def call_ai(prompt, page="general", json_mode=False):
     sys = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
     for fn, src in [
@@ -518,6 +573,17 @@ def call_ai(prompt, page="general", json_mode=False):
     
     if json_mode: return {} # لضمان عدم تعطل الواجهة عند توقع dict
     return {"success":False,"response":"فشل الاتصال بجميع مزودي AI","source":"none"}
+
+
+def generate_action_summary(actions_text: str) -> dict:
+    """تلخيص إداري قصير للإجراءات المنفذة بشكل اقتصادي."""
+    prompt = (
+        "أنت مدير عمليات متجر تجاري. راجع قائمة الإجراءات التالية واكتب ملخصاً إدارياً قصيراً ومحفزاً "
+        "(في 3 نقاط) يوضح تأثير هذه التعديلات على تنافسية المتجر. لا تذكر تفاصيل تقنية، "
+        "بل ركز على القيمة التجارية.\n\n"
+        f"{actions_text}"
+    )
+    return call_ai(prompt, page="general")
 
 # ══ Gemini Chat ══════════════════════════════════════════════════════════════
 def gemini_chat(message, history=None, system_extra=""):
