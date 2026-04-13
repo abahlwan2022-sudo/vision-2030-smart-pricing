@@ -55,7 +55,10 @@ def _classify_rejected(name: str) -> bool:
     return any(w in nl for w in rejects)
 
 def apply_strict_pipeline_filters(
-    df: pd.DataFrame, name_col: str = "منتج_المنافس", min_ml: float = 2.0
+    df: pd.DataFrame,
+    name_col: str = "منتج_المنافس",
+    min_ml: float = 2.0,
+    keep_excluded: bool = True,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """فلاتر استبعاد المنتجات مع تسجيل الأسباب بدقة."""
     if df is None or df.empty:
@@ -79,6 +82,7 @@ def apply_strict_pipeline_filters(
         "excluded_rows": []
     }
     keep_idx: List[Any] = []
+    excluded_reasons: Dict[int, str] = {}
 
     for idx, row in df.iterrows():
         name = str(row.get(actual_col, "")).strip()
@@ -86,17 +90,20 @@ def apply_strict_pipeline_filters(
         # 1. الأسماء الفارغة
         if not name or name.lower() in ("nan", "none", "<na>"):
             stats["dropped_empty_name"] += 1
+            excluded_reasons[idx] = "اسم فارغ"
             continue
             
         # 2. كلمات استبعاد العينات
         if _is_sample_strict(name):
             stats["dropped_sample_kw"] += 1
             stats["excluded_rows"].append({"name": name, "reason": "كلمة عينة محظورة"})
+            excluded_reasons[idx] = "كلمة عينة محظورة"
             continue
             
         if _classify_rejected(name):
             stats["dropped_class_rejected"] += 1
             stats["excluded_rows"].append({"name": name, "reason": "تصنيف مستبعد (عينة/تقسيم)"})
+            excluded_reasons[idx] = "تصنيف مستبعد (عينة/تقسيم)"
             continue
             
         # 3. الأحجام الصغيرة جداً (أقل من 2 مل افتراضياً بدل 5 مل)
@@ -104,13 +111,21 @@ def apply_strict_pipeline_filters(
         if 0 < ml < min_ml:
             stats["dropped_small_ml"] += 1
             stats["excluded_rows"].append({"name": name, "reason": f"حجم صغير جداً ({ml} مل)"})
+            excluded_reasons[idx] = f"حجم صغير جداً ({ml} مل)"
             continue
 
         keep_idx.append(idx)
 
-    out = df.loc[keep_idx].reset_index(drop=True) if keep_idx else pd.DataFrame()
-    stats["dropped"] = len(df) - len(out)
-    stats["kept"] = len(out)
+    # FIX: Relaxed Constraints — Zero Data Loss: لا نحذف الصفوف افتراضياً، نضيف سبب الاستبعاد فقط.
+    if keep_excluded:
+        out = df.copy()
+        out["سبب_الاستبعاد"] = out.index.map(lambda i: excluded_reasons.get(i, ""))
+    else:
+        out = df.loc[keep_idx].reset_index(drop=True) if keep_idx else pd.DataFrame()
+        if not out.empty:
+            out["سبب_الاستبعاد"] = ""
+    stats["dropped"] = len(excluded_reasons)
+    stats["kept"] = len(df) - len(excluded_reasons)
     return out, stats
 
 def sanitize_salla_text(text: str) -> str:

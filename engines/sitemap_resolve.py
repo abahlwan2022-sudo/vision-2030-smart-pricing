@@ -199,6 +199,70 @@ def _parse_sitemap_xml(xml_text: str) -> Tuple[List[SitemapEntry], List[str]]:
     return entries, sub_sitemaps
 
 
+async def resolve_sitemap_recursively(
+    session: aiohttp.ClientSession,
+    sitemap_url: str,
+    max_depth: int = 3,
+    current_depth: int = 0,
+) -> set[str]:
+    # FIX: Deep Sitemap & AI Fallback Integrated
+    if current_depth > max_depth:
+        return set()
+    try:
+        async with session.get(
+            sitemap_url,
+            headers=get_xml_headers(),
+            ssl=False,
+            allow_redirects=True,
+            timeout=30,
+        ) as response:
+            if response.status != 200:
+                return set()
+            content = await response.read()
+            root = ET.fromstring(content)
+
+            # FIX: Deep Sitemap & AI Fallback Integrated
+            # إزالة Namespaces لتسهيل البحث الآمن عبر جميع القوالب.
+            for elem in root.iter():
+                if "}" in elem.tag:
+                    elem.tag = elem.tag.split("}", 1)[1]
+
+            urls: set[str] = set()
+            if root.tag == "sitemapindex":
+                # FIX: Deep Sitemap & AI Fallback Integrated
+                # تتبع sitemapindex المتداخل بالتوازي الكامل.
+                tasks = []
+                for loc in root.findall(".//loc"):
+                    if loc.text:
+                        tasks.append(
+                            resolve_sitemap_recursively(
+                                session,
+                                loc.text.strip(),
+                                max_depth,
+                                current_depth + 1,
+                            )
+                        )
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in results:
+                    if isinstance(res, set):
+                        urls.update(res)
+            elif root.tag == "urlset":
+                for loc in root.findall(".//loc"):
+                    if not loc.text:
+                        continue
+                    loc_text = loc.text.strip()
+                    if (
+                        "/p/" in loc_text
+                        or "-p" in loc_text
+                        or "product" in loc_text.lower()
+                    ):
+                        urls.add(loc_text)
+            return urls
+    except Exception as exc:
+        logger.debug("resolve_sitemap_recursively failed for %s: %s", sitemap_url, exc)
+        return set()
+
+
 async def _fetch_and_parse_sitemap(
     session: aiohttp.ClientSession,
     url: str,
@@ -210,38 +274,16 @@ async def _fetch_and_parse_sitemap(
     يجلب ويحلل sitemap (يتتبع sitemapindex بشكل متكرر حتى max_depth).
     يستخدم Semaphore لتقييد التزامن ومنع انفجار coroutines عند sitemapindex ضخم.
     """
-    if depth > max_depth:
+    # FIX: Deep Sitemap & AI Fallback Integrated
+    urls = await resolve_sitemap_recursively(
+        session=session,
+        sitemap_url=url,
+        max_depth=max_depth,
+        current_depth=depth,
+    )
+    if not urls:
         return []
-
-    # إنشاء السيمافور عند أول استدعاء — يُمرَّر للاستدعاءات الفرعية
-    if sem is None:
-        sem = asyncio.Semaphore(_SITEMAP_CONCURRENCY)
-
-    async with sem:
-        xml = await _fetch_xml(session, url)
-        if not xml:
-            return []
-
-        if "<urlset" not in xml[:2000] and "<sitemapindex" not in xml[:2000]:
-            return []
-
-        entries, sub_sitemaps = _parse_sitemap_xml(xml)
-
-    if sub_sitemaps:
-        # تقسيم الطلبات الفرعية إلى دفعات لمنع إنشاء آلاف coroutines دفعة واحدة
-        batch_size = _SITEMAP_CONCURRENCY
-        for i in range(0, len(sub_sitemaps), batch_size):
-            batch = sub_sitemaps[i:i + batch_size]
-            tasks = [
-                _fetch_and_parse_sitemap(session, sub_url, depth + 1, max_depth, sem)
-                for sub_url in batch
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
-                if isinstance(r, list):
-                    entries.extend(r)
-
-    return entries
+    return [SitemapEntry(url=u) for u in urls]
 
 
 async def _sitemaps_from_robots(

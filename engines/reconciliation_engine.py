@@ -288,6 +288,7 @@ def reconcile_competitor_upload(
     failed_rows: List[Dict[str, Any]] = []
     new_rows: List[Dict[str, Any]] = []
     matched = new_r = corrupted = 0
+    duplicate_skipped = 0
     total = 0
 
     for cname, cdf in comp_dfs.items():
@@ -372,13 +373,23 @@ def reconcile_competitor_upload(
                 failed_rows.append(fr)
                 continue
 
+            # FIX: Relaxed Constraints — مفتاح إزالة التكرار أقل عدوانية
+            # لمنع دمج اختلافات حقيقية (مثل روائح/أحجام/أنواع مختلفة).
+            _size_hint = str(extract_size(cp) or "").strip().lower()
+            _type_hint = str(extract_type(cp) or "").strip().lower()
+            _gender_hint = str(extract_gender(cp) or "").strip().lower()
             dedupe_key = (
                 str(cname or "").strip().lower(),
-                comp_sku_key or bare_ck,
-                url_v or bare_ck,
+                comp_sku_key or "",
+                url_v or "",
+                bare_ck,
+                _size_hint,
+                _type_hint,
+                _gender_hint,
             )
             if dedupe_key in seen_keys:
                 matched += 1
+                duplicate_skipped += 1
                 continue
             seen_keys.add(dedupe_key)
 
@@ -480,6 +491,7 @@ def reconcile_competitor_upload(
         "fuzzy_min": _FUZZY_MIN,
         "cdist_chunk": _CDIST_CHUNK,
         "catalog_size": len(catalog_norms),
+        "duplicate_skipped": duplicate_skipped,
     }
     return report
 
