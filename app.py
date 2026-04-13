@@ -2060,11 +2060,36 @@ if page == "📊 لوحة التحكم":
 
     # ── جسر الكشط التلقائي (Auto-Scraper Bridge) ─────────────────────────
     import os as _os_dash
-    _AUTO_CSV = _os_dash.path.join(
-        _os_dash.environ.get("DATA_DIR", "data"), "competitors_latest.csv"
-    )
+    import json as _json_dash
+    _DATA_D = _os_dash.environ.get("DATA_DIR", "data")
+    _AUTO_CSV = _os_dash.path.join(_DATA_D, "competitors_latest.csv")
+    _DAEMON_ST = _os_dash.path.join(_DATA_D, "daemon_state.json")
     _auto_available = _os_dash.path.exists(_AUTO_CSV)
     _auto_rows = 0   # ← يُهيَّأ دائماً لمنع NameError إذا تغيّرت حالة الملف بين reruns
+    _daemon_running = False
+    _db_comp_total = 0
+
+    try:
+        from utils.db_manager import get_competitor_store_stats
+        _db_comp_total = int((get_competitor_store_stats() or {}).get("total_products") or 0)
+    except Exception:
+        _db_comp_total = 0
+
+    try:
+        if _os_dash.path.exists(_DAEMON_ST):
+            with open(_DAEMON_ST, encoding="utf-8") as _dsf:
+                _ds = _json_dash.load(_dsf)
+            if isinstance(_ds, dict):
+                _daemon_running = bool(_ds.get("running"))
+    except Exception:
+        _daemon_running = False
+
+    if _daemon_running:
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=4000, key="dash_daemon_live_refresh")
+        except ImportError:
+            pass
 
     # تشغيل تلقائي لوضع البيانات الآلية بمجرد توفر ملف الناتج
     # (المستخدم يقدر يلغيه يدوياً إذا أراد).
@@ -2078,11 +2103,14 @@ if page == "📊 لوحة التحكم":
                 _auto_rows = sum(1 for _ in _af) - 1
         except Exception:
             pass
+        # أثناء عمل الـ daemon: العدد الحقيقي من SQLite (يتحدث مع كل منتج ناجح)
+        _display_rows = max(_auto_rows, _db_comp_total)
+        _live_hint = " · يتحدّث تلقائياً أثناء الكشط" if _daemon_running else ""
         st.markdown(
             f'<div style="background:#0a2a0a;border:1px solid #00C853;border-radius:8px;'
             f'padding:10px 14px;margin:6px 0;font-size:.88rem">'
             f'🤖 <b>بيانات الكشط التلقائي جاهزة</b> — '
-            f'{_auto_rows:,} منتج من المنافسين<br>'
+            f'{_display_rows:,} منتج من المنافسين{_live_hint}<br>'
             f'<span style="color:#9e9e9e;font-size:.78rem">'
             f'استخدمها مباشرةً بدلاً من رفع ملف يدوي</span></div>',
             unsafe_allow_html=True,
@@ -2118,7 +2146,7 @@ if page == "📊 لوحة التحكم":
     else:
         comp_files = None  # غير مستخدم عند التحميل التلقائي
         st.success(
-            f"✅ سيُستخدم الملف الآلي: `{_AUTO_CSV}` ({_auto_rows:,} منتج)"
+            f"✅ سيُستخدم الملف الآلي: `{_AUTO_CSV}` ({_display_rows:,} منتج)"
         )
 
     if our_file is not None:
