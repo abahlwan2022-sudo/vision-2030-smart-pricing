@@ -27,7 +27,7 @@ except ImportError:
 def main() -> int:
     import requests
 
-    from config import ZENROWS_API_KEY, ZENROWS_MODE
+    from config import ZENROWS_API_KEY
 
     key = (ZENROWS_API_KEY or "").strip()
     if not key:
@@ -39,11 +39,15 @@ def main() -> int:
         return 1
 
     target = (sys.argv[1] if len(sys.argv) > 1 else "https://alkhabeershop.com").strip()
-    mode = (ZENROWS_MODE or "auto").strip() or "auto"
 
     r = requests.get(
         "https://api.zenrows.com/v1/",
-        params={"url": target, "apikey": key, "mode": mode},
+        params={
+            "url": target,
+            "apikey": key,
+            "js_render": "true",
+            "premium_proxy": "true",
+        },
         timeout=90,
     )
     text = r.text or ""
