@@ -3774,6 +3774,15 @@ elif page == "⚡ أتمتة Make":
 #  ✅ لا time.sleep()، لا infinite reruns
 # ════════════════════════════════════════════════
 elif page == "🕷️ كشط المنافسين":
+    # vNext: delegate this page بالكامل إلى واجهة scraper_advanced
+    # لمنع تكرار الواجهات (legacy dashboard + new daemon panel) في نفس الشاشة.
+    try:
+        import pages.scraper_advanced as _scraper_advanced_page
+        _scraper_advanced_page.show(embedded=False)
+        st.stop()
+    except Exception as _delegation_err:
+        st.error(f"❌ تعذّر تحميل شاشة الكشط الجديدة: {_delegation_err}")
+
     import subprocess
     import sys as _sys_sc
     import os as _os_scraper
