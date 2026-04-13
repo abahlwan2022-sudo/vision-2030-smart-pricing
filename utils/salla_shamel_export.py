@@ -14,11 +14,15 @@ import csv
 import difflib
 import html as _html_lib
 import io
+import os
 import re
 import unicodedata
+from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
+import streamlit as st
+from utils import brand_manager
 
 # ── 40 عمود بالترتيب الحرفي المطابق لـ سلة ──────────────────────────────
 SALLA_SHAMEL_COLUMNS: list[str] = [
@@ -77,6 +81,7 @@ _GENDER_CATEGORY = {
     "unisex":   "العطور > عطور للجنسين",
 }
 _DEFAULT_CATEGORY = "العطور > عطور للجنسين"
+_CATEGORY_CSV_CANDIDATES = ("تصنيفات مهووس.csv", "data/تصنيفات مهووس.csv")
 
 
 def _norm_text(s: str) -> str:
@@ -96,12 +101,85 @@ def _safe_str(v: Any) -> str:
     return "" if s.lower() in ("nan", "none", "<na>") else s
 
 
-def _slug_brand(brand: str) -> str:
-    """تحويل اسم الماركة لـ slug مناسب لـ URL سلة"""
-    b = str(brand or "").strip().lower()
-    b = re.sub(r"[^a-z0-9\u0600-\u06FF\s-]", "", b)
-    b = re.sub(r"\s+", "-", b).strip("-")
-    return b or "brand"
+@st.cache_data(ttl=3600)
+def load_salla_categories_safe():
+    # البحث عن الملف في المسار الرئيسي أو مجلد data
+    file_path = "تصنيفات مهووس.csv"
+    if not os.path.exists(file_path):
+        file_path = os.path.join("data", "تصنيفات مهووس.csv")
+
+    if os.path.exists(file_path):
+        try:
+            df_cats = pd.read_csv(file_path)
+            if "التصنيفات" in df_cats.columns:
+                return [str(x).strip() for x in df_cats["التصنيفات"].dropna().tolist()]
+        except Exception:
+            pass  # تجاهل الخطأ بصمت لمنع انهيار النظام
+    return []
+
+
+def _sanitize_alt_text(text: str) -> str:
+    # FIX: Salla Strict CSV Validation
+    cleaned = re.sub(r"[^\w\s\u0600-\u06FF]", "", _safe_str(text))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _resolve_brand_safe(raw_brand: str) -> str:
+    # FIX: Salla Strict CSV Validation
+    brand_raw = _safe_str(raw_brand)
+    if not brand_raw or brand_raw in ("غير متوفر", "غير محدد"):
+        return ""
+    try:
+        mgr = brand_manager.BrandManager.get_instance()
+        matched = mgr._fuzzy_match_known(brand_raw)  # type: ignore[attr-defined]
+        return _safe_str(matched) if matched else ""
+    except Exception:
+        return ""
+
+
+def _sanitize_category_safe(raw_cat, export_mode="safe"):
+    if pd.isna(raw_cat) or not str(raw_cat).strip():
+        return ""
+
+    cleaned_cat = str(raw_cat).strip()
+    if export_mode == "safe":
+        cleaned_cat = cleaned_cat.split(">")[-1].strip()
+
+    valid_cats = load_salla_categories_safe()
+    if not valid_cats:
+        return cleaned_cat  # Fallback إذا لم يتم العثور على ملف التصنيفات
+
+    # 1. المطابقة التامة (Exact Match) - الأولوية الأولى
+    for v_cat in valid_cats:
+        if cleaned_cat.lower() == v_cat.lower():
+            return v_cat
+
+    # 2. المطابقة التقريبية الصارمة (95%) - الأولوية الثانية
+    best_match = None
+    highest_ratio = 0.0
+    for v_cat in valid_cats:
+        ratio = difflib.SequenceMatcher(None, cleaned_cat.lower(), v_cat.lower()).ratio()
+        if ratio > highest_ratio:
+            highest_ratio = ratio
+            best_match = v_cat
+
+    # نقبل فقط التطابق شبه المتطابق تماماً لتجنب الأخطاء الكارثية
+    if highest_ratio >= 0.95:
+        return best_match
+
+    return ""  # إرجاع فارغ بدلاً من إرجاع تصنيف خاطئ يرفضه نظام سلة
+
+
+def generate_safe_slug(text):
+    if pd.isna(text) or not str(text).strip():
+        return ""
+    # إزالة الرموز الخاصة، الإبقاء على الحروف (عربي/إنجليزي)، الأرقام، والشرطات
+    safe_slug = re.sub(r"[^a-zA-Z0-9\u0600-\u06FF\s-]", "", str(text)).strip()
+    # استبدال المسافات بشرطات
+    safe_slug = safe_slug.replace(" ", "-")
+    # منع تكرار الشرطات المتتالية (مثل --)
+    safe_slug = re.sub(r"-+", "-", safe_slug)
+    return safe_slug
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -122,6 +200,8 @@ def generate_salla_html_description(
     longevity: str = "8",
     sillage: str = "8",
     steadiness: str = "9",
+    description_text: str = "",
+    fragrance_notes: str = "",
 ) -> str:
     """
     قالب HTML من 7 أقسام — مطابق لملف منتج_جديد.csv من سلة.
@@ -136,11 +216,18 @@ def generate_salla_html_description(
       7. h3 الأسئلة الشائعة (ul) + h3 اكتشف أكثر (p) + p ختامي
     """
     pn  = _html_lib.escape(_safe_str(product_name) or "منتج", quote=False)
-    br  = _html_lib.escape(_safe_str(brand_name)   or "غير متوفر", quote=False)
+    brand_raw = _safe_str(brand_name)  # FIX: Salla Exact Match & Smart HTML
+    brand_valid = bool(brand_raw and brand_raw != "غير متوفر")  # FIX: Salla Exact Match & Smart HTML
+    br  = _html_lib.escape(brand_raw or "غير متوفر", quote=False)
     gn  = _html_lib.escape(_safe_str(gender)        or "للجنسين", quote=False)
     sz  = _html_lib.escape(_safe_str(size_ml)       or "100", quote=False)
     cc  = _html_lib.escape(_safe_str(concentration) or "أو دو بارفيوم", quote=False)
-    ff  = _html_lib.escape(_safe_str(fragrance_family) or "غير متوفر", quote=False)
+    ff_raw = _safe_str(fragrance_family)  # FIX: Salla Exact Match & Smart HTML
+    ff = _html_lib.escape(ff_raw or "غير متوفر", quote=False)
+    ff_faq = _html_lib.escape(
+        ff_raw if ff_raw and ff_raw != "غير متوفر" else "مزيج عطري ساحر وفريد.",
+        quote=False,
+    )  # FIX: Salla Exact Match & Smart HTML
     tn  = _html_lib.escape(_safe_str(top_notes)     or "غير متوفر", quote=False)
     hn  = _html_lib.escape(_safe_str(heart_notes)   or "غير متوفر", quote=False)
     bn  = _html_lib.escape(_safe_str(base_notes)    or "غير متوفر", quote=False)
@@ -150,75 +237,76 @@ def generate_salla_html_description(
     sig = _safe_str(sillage) or "8"
     std = _safe_str(steadiness) or "9"
 
-    brand_slug = _slug_brand(brand_name)
-    brand_url  = f"https://mahwous.com/brands/{brand_slug}"
+    safe_slug = generate_safe_slug(brand_raw) if brand_valid else ""
+    brand_slug = safe_slug.strip("-") if safe_slug else ""
+    brand_url  = f"https://mahwous.com/brands/{brand_slug}" if brand_slug else "https://mahwous.com/"  # FIX: Salla Exact Match & Smart HTML
     bu  = _html_lib.escape(brand_url, quote=True)
+    brand_intro = (
+        f'<strong><a href="{bu}" target="_blank" rel="noopener">{br}</a></strong>'
+        if brand_valid else "أرقى الدور العريقة"
+    )  # FIX: Salla Exact Match & Smart HTML
+    brand_details = (
+        f'<a href="{bu}" target="_blank" rel="noopener">{br}</a>'
+        if brand_valid else "أرقى الدور العريقة"
+    )  # FIX: Salla Exact Match & Smart HTML
+    heritage_line = (
+        f"من دار {br} العريقة بتراث عطري أصيل."
+        if brand_valid else "من أرقى الدور العريقة بتراث عطري أصيل."
+    )  # FIX: Salla Exact Match & Smart HTML
+    discover_line = (
+        f'اكتشف <a href="{bu}" target="_blank" rel="noopener">عطور {br}</a>'
+        if brand_valid
+        else '<a href="https://mahwous.com/" target="_blank" rel="noopener">اكتشف المزيد من عطور مهووس</a>'
+    )  # FIX: Salla Exact Match & Smart HTML
 
     size_label = f"{sz} مل" if sz.isdigit() else sz
-
-    return (
-        # ── 1. عنوان رئيسي + مقدمة ──────────────────────────────────────
-        f"<h2>{pn} {pn} {cc} {size_label} {gn}</h2>\n"
-        f"<p>اكتشف سحر <strong>{pn}</strong> من "
-        f'<strong><a href="{bu}" target="_blank" rel="noopener">{br}</a></strong>'
-        f" — عطر {ff} فاخر يجمع بين الأصالة والتميز. "
-        f"صمّم خصيصاً ل{gn} ليرسم بصمتك العطري بثقة وأناقة. "
-        f"متوفّر بحجم {size_label} بتركيز <strong>{cc}</strong> لضمان ثبات استثنائي.</p>\n"
-
-        # ── 2. تفاصيل المنتج ─────────────────────────────────────────────
-        "<h3>تفاصيل المنتج</h3>\n<ul>\n"
-        f'<li><strong>الماركة:</strong> <a href="{bu}" target="_blank" rel="noopener">{br}</a></li>\n'
-        f"<li><strong>الاسم:</strong> {pn}</li>\n"
-        f"<li><strong>الجنس:</strong> {gn}</li>\n"
-        f"<li><strong>العائلة العطرية:</strong> {ff}</li>\n"
-        f"<li><strong>الحجم:</strong> {size_label}</li>\n"
-        f"<li><strong>التركيز:</strong> {cc}</li>\n"
-        "<li><strong>نوع المنتج:</strong> عطر أصلي</li>\n"
-        "</ul>\n"
-
-        # ── 3. رحلة العطر — الهرم العطري ──────────────────────────────
-        "<h3>رحلة العطر — الهرم العطري</h3>\n"
-        f"<p>يأخذك <strong>{pn}</strong> في رحلة عطرية متكاملة تبدأ بطزالة وتنتهي بدفء وعمق.</p>\n"
-        "<ul>\n"
-        f"<li><strong>المقدمة (Top Notes):</strong> {tn}</li>\n"
-        f"<li><strong>القلب (Heart Notes):</strong> {hn}</li>\n"
-        f"<li><strong>القاعدة (Base Notes):</strong> {bn}</li>\n"
-        "</ul>\n"
-
-        # ── 4. لماذا تختار هذا العطر؟ ────────────────────────────────
-        "<h3>لماذا تختار هذا العطر؟</h3>\n<ul>\n"
-        f"<li><strong>الثبات والفوحان:</strong> تركيز {cc} يضمن فوحاناً يدوم طويلاً يلفت الأنظار.</li>\n"
-        f"<li><strong>التميز والأصالة:</strong> من دار {br} العريقة بتراث عطري أصيل.</li>\n"
-        "<li><strong>القيمة الاستثنائية:</strong> عطر فاخر بسعر مناسب من متجر مهووس الموثوق.</li>\n"
-        "<li><strong>الجاذبية المضمونة:</strong> عطر يجعلك محور الاهتمام في كل مكان تحضره.</li>\n"
-        "</ul>\n"
-
-        # ── 5. متى وأين ترتديه؟ ──────────────────────────────────────
-        "<h3>متى وأين ترتديه؟</h3>\n"
-        f"<p>مثالي لـ {sea}. يلائم {occ}. "
-        "ينصح برشه على نقاط النبض والرسغاوات لأفضل ثبات.</p>\n"
-
-        # ── 6. لمسة خبير من مهووس ────────────────────────────────────
-        "<h3>لمسة خبير من مهووس</h3>\n"
-        f"<p>الفوحان: {sig}/10 | الثبات: {std}/10 | "
-        "نصيحة: ابدأ بكمية صغيرة وابنِ تدريجياً حتى تجد كميتك المثالية.</p>\n"
-
-        # ── 7. الأسئلة الشائعة ───────────────────────────────────────
-        "<h3>الأسئلة الشائعة</h3>\n<ul>\n"
-        f"<li><strong>كم يدوم العطر؟</strong> بين {lng}-12 ساعة حسب البشرة ودرجة الحرارة.</li>\n"
-        "<li><strong>هل يناسب الاستخدام اليومي؟</strong> نعم، بكمية معتدلة للبيئات المختلفة.</li>\n"
-        f"<li><strong>ما العائلة العطرية؟</strong> {ff}.</li>\n"
-        "<li><strong>هل يناسب الطقس الحار في السعودية؟</strong> جميع الفصول هي الموسم المثالي له.</li>\n"
-        f"<li><strong>ما مناسبات ارتداء هذا العطر؟</strong> {occ}.</li>\n"
-        "</ul>\n"
-
-        # ── اكتشف أكثر من مهووس ──────────────────────────────────────
-        "<h3>اكتشف أكثر من مهووس</h3>\n"
-        f'<p>اكتشف <a href="{bu}" target="_blank" rel="noopener">عطور {br}</a> | '
-        '<a href="https://mahwous.com/categories/mens-perfumes" target="_blank" rel="noopener">عطور رجالية</a> | '
-        '<a href="https://mahwous.com/categories/womens-perfumes" target="_blank" rel="noopener">عطور نسائية</a></p>\n'
-        "<p><strong>عالمك العطري يبدأ من مهووس.</strong> أصلي 100% | شحن سريع داخل السعودية.</p>"
+    brand_sentence = _html_lib.escape(heritage_line, quote=False)
+    fallback_desc = (
+        f"اكتشف سحر {pn} بتركيز {cc} وحجم {size_label}، عطر {ff} مصمم ل{gn} بإحساس فاخر يدوم."
     )
+    description_safe = _html_lib.escape(_safe_str(description_text) or fallback_desc, quote=False)
+    notes_raw = _safe_str(fragrance_notes)
+    if not notes_raw:
+        notes_raw = (
+            f"إفتتاحية العطر: {tn}. قلب العطر: {hn}. قاعدة العطر: {bn}."
+            if any(x != "غير متوفر" for x in (top_notes, heart_notes, base_notes))
+            else "مزيج عطري ساحر ينبض بالجاذبية والفخامة، صُمم ليترك أثراً لا يُنسى."
+        )
+    fragrance_notes_safe = _html_lib.escape(notes_raw, quote=False)  # FIX: Zero-Gap HTML & AI Fragrance Notes
+    brand_link_html = (
+        f"<p style=\"margin: 0;\"><a href=\"{bu}\" target=\"_blank\" rel=\"noopener\">اكتشف المزيد من عطور {br}</a></p>"
+        if brand_valid
+        else "<p style=\"margin: 0;\"><a href=\"https://mahwous.com/\" target=\"_blank\" rel=\"noopener\">اكتشف المزيد من عطور مهووس</a></p>"
+    )
+    raw_html = f"""
+    <div dir="rtl" style="line-height: 1.5; font-family: Tahoma, Arial, sans-serif; color: #333;">
+        <h2 style="margin: 0 0 8px 0; color: #2c3e50; font-size: 20px;">{pn}</h2>
+        <p style="margin: 0 0 12px 0;">{description_safe}</p>
+
+        <h3 style="margin: 12px 0 5px 0; color: #b8860b; font-size: 16px;">المكونات العطرية:</h3>
+        <p style="margin: 0 0 12px 0; font-weight: bold;">{fragrance_notes_safe}</p>
+
+        <h3 style="margin: 12px 0 5px 0; color: #2c3e50; font-size: 16px;">لماذا تختار هذا العطر؟</h3>
+        <ul style="margin: 0 0 12px 0; padding-right: 20px;">
+            <li style="margin-bottom: 4px;"><strong>التميز والأصالة:</strong> {brand_sentence}</li>
+            <li style="margin-bottom: 4px;"><strong>الجاذبية المضمونة:</strong> عطر يجعلك محور الاهتمام في كل مكان.</li>
+            <li style="margin-bottom: 4px;"><strong>الأداء:</strong> الفوحان {sig}/10 والثبات {std}/10.</li>
+            <li style="margin-bottom: 4px;"><strong>المناسبات:</strong> يلائم {occ} خلال {sea}.</li>
+        </ul>
+
+        <h3 style="margin: 12px 0 5px 0; color: #2c3e50; font-size: 16px;">الأسئلة الشائعة:</h3>
+        <ul style="margin: 0 0 12px 0; padding-right: 20px;">
+            <li style="margin-bottom: 4px;"><strong>كم يدوم العطر؟</strong> بين {lng}-12 ساعة حسب البشرة ودرجة الحرارة.</li>
+            <li style="margin-bottom: 4px;"><strong>ما هي العائلة العطرية؟</strong> {ff_faq}</li>
+            <li style="margin-bottom: 4px;"><strong>متى أستخدمه؟</strong> صُمم ليناسب كافة أوقاتك المميزة.</li>
+        </ul>
+        {brand_link_html}
+    </div>
+    """  # FIX: Zero-Gap HTML & AI Fragrance Notes
+
+    clean_html = raw_html.replace("\n", " ").replace("\r", "")
+    clean_html = re.sub(r"\s{2,}", " ", clean_html).strip()  # FIX: Zero-Gap HTML & AI Fragrance Notes
+    return clean_html
 
 
 def sanitize_salla_description_html(raw: str) -> str:
@@ -293,15 +381,14 @@ def _extract_image(row: dict) -> str:
     return ""
 
 
-def _extract_category(row: dict, gender: str) -> str:
+def _extract_category(row: dict, gender: str, export_mode: str = "safe") -> str:
     for k in ("التصنيف_الرسمي", "تصنيف المنتج", "التصنيف", "category"):
         v = _safe_str(row.get(k, ""))
         if v:
-            # إذا كانت فئة سلة جاهزة
-            if ">" in v:
-                return v
+            return _sanitize_category_safe(v, export_mode=export_mode)  # FIX: Salla Strict CSV Validation
     # اشتق من الجنس
-    return _GENDER_CATEGORY.get(gender, _DEFAULT_CATEGORY)
+    fallback_cat = _GENDER_CATEGORY.get(gender, _DEFAULT_CATEGORY)
+    return _sanitize_category_safe(fallback_cat, export_mode=export_mode)  # FIX: Salla Strict CSV Validation
 
 
 def _extract_notes(row: dict) -> tuple[str, str, str]:
@@ -390,6 +477,7 @@ def build_salla_shamel_dataframe(
     missing_df: pd.DataFrame,
     our_catalog_df: Optional[pd.DataFrame] = None,
     verify_missing: bool = True,
+    export_mode: str = "safe",  # FIX: Salla Export Mode Toggle
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     يبني DataFrame بـ 40 عمود من جدول المنتجات المفقودة.
@@ -418,19 +506,22 @@ def build_salla_shamel_dataframe(
         size    = _extract_size(r)
         price   = _extract_price(r)
         image   = _extract_image(r)
-        cat     = _extract_category(r, gender)
+        cat     = _extract_category(r, gender, export_mode=export_mode)  # FIX: Salla Export Mode Toggle
         top_n, heart_n, base_n = _extract_notes(r)
-        img_alt = f"زجاجة عطر {pname} {size} مل الأصلية" if pname else ""
+        img_alt = _sanitize_alt_text(pname) if pname else ""  # FIX: Salla Strict CSV Validation
+        safe_brand = _resolve_brand_safe(brand)  # FIX: Salla Strict CSV Validation
 
         description = generate_salla_html_description(
             product_name=pname,
-            brand_name=brand,
+            brand_name=safe_brand or "غير متوفر",
             gender=gender,
             size_ml=size,
             fragrance_family=_safe_str(r.get("العائلة_العطرية", "غير متوفر")),
             top_notes=top_n,
             heart_notes=heart_n,
             base_notes=base_n,
+            description_text=_safe_str(r.get("description", "")),
+            fragrance_notes=_safe_str(r.get("fragrance_notes", "")),  # FIX: Zero-Gap HTML & AI Fragrance Notes
         )
 
         out: dict[str, Any] = {c: "" for c in SALLA_SHAMEL_COLUMNS}
@@ -448,19 +539,19 @@ def build_salla_shamel_dataframe(
         out["السعر المخفض"]              = ""
         out["تاريخ بداية التخفيض"]       = ""
         out["تاريخ نهاية التخفيض"]       = ""
-        out["اقصي كمية لكل عميل"]        = 0
-        out["إخفاء خيار تحديد الكمية"]  = 0
-        out["اضافة صورة عند الطلب"]     = 0
+        out["اقصي كمية لكل عميل"]        = 100  # FIX: Salla Strict CSV Validation
+        out["إخفاء خيار تحديد الكمية"]  = "لا"  # FIX: Salla Strict CSV Validation
+        out["اضافة صورة عند الطلب"]     = "لا"  # FIX: Salla Strict CSV Validation
         out["الوزن"]                     = 0.2
         out["وحدة الوزن"]               = "kg"
-        out["الماركة"]                   = brand if brand != "غير متوفر" else ""
+        out["الماركة"]                   = safe_brand  # FIX: Salla Strict CSV Validation
         out["العنوان الترويجي"]          = ""
         out["تثبيت المنتج"]              = ""
         out["الباركود"]                  = ""
         out["السعرات الحرارية"]          = ""
         out["MPN"]                       = ""
         out["GTIN"]                      = ""
-        out["خاضع للضريبة ؟"]           = "نعم"
+        out["خاضع للضريبة ؟"]           = "نعم"  # FIX: Salla Strict CSV Validation
         out["سبب عدم الخضوع للضريبة"]   = ""
         rows.append(out)
 
@@ -476,6 +567,7 @@ def export_to_salla_shamel_csv(
     missing_df: pd.DataFrame,
     our_catalog_df: Optional[pd.DataFrame] = None,
     verify_missing: bool = True,
+    export_mode: str = "safe",  # FIX: Salla Export Mode Toggle
 ) -> tuple[bytes, int, pd.DataFrame]:
     """
     يصدّر إلى CSV مطابق لقالب سلة الرسمي (منتج_جديد.csv).
@@ -488,7 +580,7 @@ def export_to_salla_shamel_csv(
     يُعيد (csv_bytes, عدد_المنتجات_المُصدَّرة, found_in_catalog_df)
     """
     salla_df, found_df = build_salla_shamel_dataframe(
-        missing_df, our_catalog_df, verify_missing=verify_missing
+        missing_df, our_catalog_df, verify_missing=verify_missing, export_mode=export_mode
     )
 
     buf = io.StringIO()
@@ -508,6 +600,7 @@ def export_to_salla_shamel(
     our_catalog_df: Optional[pd.DataFrame] = None,
     generate_descriptions: bool = True,
     verify_missing: bool = True,
+    export_mode: str = "safe",  # FIX: Salla Export Mode Toggle
 ) -> bytes:
     """
     يصدّر إلى xlsx عبر io.BytesIO — بدون disk I/O.
@@ -515,7 +608,7 @@ def export_to_salla_shamel(
     """
     _ = generate_descriptions
     salla_df, _ = build_salla_shamel_dataframe(
-        missing_df, our_catalog_df, verify_missing=verify_missing
+        missing_df, our_catalog_df, verify_missing=verify_missing, export_mode=export_mode
     )
     if not salla_df.empty:
         salla_df = salla_df.reindex(columns=SALLA_SHAMEL_COLUMNS)

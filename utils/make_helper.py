@@ -370,12 +370,27 @@ def send_new_products(products: List[Dict]) -> Dict:
         if len(products) > 1:
             time.sleep(0.3)
 
+    failed = len(errors)
     if sent == 0:
-        return {"success": False, "message": f"❌ فشل إرسال جميع المنتجات. تم تخطي {skipped}"}
+        return {
+            "success": False,
+            "message": f"❌ فشل إرسال جميع المنتجات. تم تخطي {skipped}",
+            "sent": sent,
+            "failed": failed,
+            "total": len(products),
+            "status_code": 0,
+        }
 
     skip_msg = f" (تم تخطي {skipped})" if skipped else ""
     err_msg  = f" (فشل {len(errors)})" if errors else ""
-    return {"success": True, "message": f"✅ تم إرسال {sent} منتج جديد إلى Make{skip_msg}{err_msg}"}
+    return {
+        "success": sent > 0,
+        "message": f"✅ تم إرسال {sent} منتج جديد إلى Make{skip_msg}{err_msg}",
+        "sent": sent,
+        "failed": failed,
+        "total": len(products),
+        "status_code": 200 if failed == 0 else 207,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -427,12 +442,27 @@ def send_missing_products(products: List[Dict]) -> Dict:
         if len(products) > 1:
             time.sleep(0.3)
 
+    failed = len(errors)
     if sent == 0:
-        return {"success": False, "message": f"❌ فشل إرسال جميع المنتجات المفقودة. تم تخطي {skipped}"}
+        return {
+            "success": False,
+            "message": f"❌ فشل إرسال جميع المنتجات المفقودة. تم تخطي {skipped}",
+            "sent": sent,
+            "failed": failed,
+            "total": len(products),
+            "status_code": 0,
+        }
 
     skip_msg = f" (تم تخطي {skipped})" if skipped else ""
     err_msg  = f" (فشل {len(errors)})" if errors else ""
-    return {"success": True, "message": f"✅ تم إرسال {sent} منتج مفقود إلى Make{skip_msg}{err_msg}"}
+    return {
+        "success": sent > 0,
+        "message": f"✅ تم إرسال {sent} منتج مفقود إلى Make{skip_msg}{err_msg}",
+        "sent": sent,
+        "failed": failed,
+        "total": len(products),
+        "status_code": 200 if failed == 0 else 207,
+    }
 
 
 # ══# ══════════════════════════════════════════════════════════════════════

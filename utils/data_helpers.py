@@ -287,17 +287,18 @@ def pid_from_row(row, col):
 
 
 def _analysis_dedupe_columns(df: pd.DataFrame) -> list[str]:
-    """أعمدة تمييز صف مطابقة واحد — الأحدث يبقى عند الدمج (keep=last)."""
+    """أعمدة تمييز قوية فقط (معرّفات/روابط) لتجنب حذف منتجات متقاربة الاسم."""
     if df is None or df.empty:
         return []
-    prefer = ["معرف_المنتج", "معرف_المنافس", "المنافس"]
-    if all(c in df.columns for c in prefer):
-        return prefer
-    fb = ["المنتج", "منتج_المنافس", "المنافس"]
-    if all(c in df.columns for c in fb):
-        return fb
-    if "المنتج" in df.columns and "المنافس" in df.columns:
-        return ["المنتج", "المنافس"]
+    strong = ["معرف_المنتج", "معرف_المنافس", "المنافس"]
+    if all(c in df.columns for c in strong):
+        return strong
+    strong_url = ["رابط_منتجنا", "رابط_المنافس", "المنافس"]
+    if all(c in df.columns for c in strong_url):
+        return strong_url
+    strong_mix = ["معرف_المنتج", "رابط_المنافس", "المنافس"]
+    if all(c in df.columns for c in strong_mix):
+        return strong_mix
     return []
 
 
@@ -319,9 +320,9 @@ def merge_price_analysis_dataframes(
     out = pd.concat([prev2, new2], ignore_index=True)
     subset = _analysis_dedupe_columns(out)
     if subset:
+        # FIX: Relaxed Constraints — عدم استخدام الاسم كمفتاح دمج لتفادي فقدان نتائج متشابهة.
         out = out.drop_duplicates(subset=subset, keep="last")
-    else:
-        out = out.drop_duplicates(keep="last")
+    # FIX: Relaxed Constraints — عند غياب مفاتيح قوية نبقي كل الصفوف (Zero Data Loss).
     return out.reset_index(drop=True)
 
 

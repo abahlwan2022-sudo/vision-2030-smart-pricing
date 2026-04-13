@@ -11,6 +11,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
+from engines.ai_engine import ai_fallback_scrape  # FIX: Deep Sitemap & AI Fallback Integrated
+
 logger = logging.getLogger(__name__)
 
 # علامات شائعة لصفحات التحدي (Cloudflare / حماية)
@@ -279,6 +281,35 @@ def extract_product_from_html(html: str, page_url: str) -> Dict[str, Any]:
         merged["sku"] = sku_el.get_text(strip=True)
 
     _finalize_merged(merged, page_url)
+
+    # FIX: Deep Sitemap & AI Fallback Integrated
+    # طبقة إنقاذ AI: تعمل فقط إذا فشل الاستخراج التقليدي في الاسم/السعر.
+    needs_ai_fallback = (
+        not str(merged.get("title") or "").strip()
+        or merged.get("price") in (None, 0, 0.0, "0")
+    )
+    if needs_ai_fallback and html:
+        ai_data = ai_fallback_scrape(html, page_url)
+        if isinstance(ai_data, dict) and not ai_data.get("error"):
+            ai_name = str(ai_data.get("name") or "").strip()
+            if ai_name:
+                merged["title"] = ai_name
+            ai_price = ai_data.get("price")
+            try:
+                ai_price_float = float(ai_price)
+            except (TypeError, ValueError):
+                ai_price_float = 0.0
+            if ai_price_float > 0:
+                merged["price"] = ai_price_float
+            if "is_available" in ai_data:
+                merged["is_available"] = bool(ai_data.get("is_available"))
+            ai_description = str(ai_data.get("description") or "").strip()
+            if ai_description and not str(merged.get("description") or "").strip():
+                merged["description"] = ai_description
+            ai_fragrance_notes = str(ai_data.get("fragrance_notes") or "").strip()
+            if ai_fragrance_notes:
+                merged["fragrance_notes"] = ai_fragrance_notes  # FIX: Zero-Gap HTML & AI Fragrance Notes
+
     return merged
 
 
