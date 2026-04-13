@@ -7,6 +7,7 @@ pages/scraper_advanced.py — لوحة كشط مهووس v5.0 (Unified Scraping 
    ▸ إدارة كاملة: إضافة / حذف / إعادة ضبط / تخطي
 
 🤖 تبويب 2 — الكشط الذكي AI (تخطي الحظر):
+   ▸ ZenRows (اختياري — ZENROWS_API_KEY) أولاً عند الضبط
    ▸ Crawl4AI + Playwright stealth
    ▸ curl_cffi Chrome120 TLS fingerprint
    ▸ cloudscraper Cloudflare bypass
@@ -78,6 +79,7 @@ _CSS = """
 .sai-result-card.success{border-left:4px solid #00C853;}
 .sai-result-card.failed {border-left:4px solid #FF1744;}
 .sai-badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.7rem;font-weight:700;}
+.badge-zenrows     {background:#26a69a22;color:#26a69a;border:1px solid #26a69a;}
 .badge-crawl4ai    {background:#4fc3f722;color:#4fc3f7;border:1px solid #4fc3f7;}
 .badge-curl_cffi   {background:#ff980022;color:#ff9800;border:1px solid #ff9800;}
 .badge-cloudscraper{background:#ab47bc22;color:#ce93d8;border:1px solid #ab47bc;}
@@ -334,7 +336,7 @@ def _parse_urls_from_csv(uploaded_file) -> List[str]:
 
 
 def _method_badge(method: str) -> str:
-    cls = {"crawl4ai": "badge-crawl4ai", "curl_cffi": "badge-curl_cffi",
+    cls = {"zenrows": "badge-zenrows", "crawl4ai": "badge-crawl4ai", "curl_cffi": "badge-curl_cffi",
            "cloudscraper": "badge-cloudscraper", "requests": "badge-requests"}.get(method, "badge-none")
     return f'<span class="sai-badge {cls}">{method or "none"}</span>'
 
@@ -413,6 +415,21 @@ def _render_full_auto_daemon_ui() -> None:
     k2.metric("Stores", f"{int(state.get('stores_done', 0))}/{int(state.get('stores_total', 18))}")
     k3.metric("Products", f"{int(state.get('products_done', 0))}/{int(state.get('products_total', 0))}")
     k4.metric("Success / Errors", f"{int(state.get('success_count', 0))} / {int(state.get('error_count', 0))}")
+
+    try:
+        from config import ZENROWS_API_KEY
+
+        if (ZENROWS_API_KEY or "").strip():
+            st.success(
+                "🛡️ **ZenRows مفعّل** — الكشط الذكي (الدايمون) والمكشط التقليدي يجرّبان وكيل ZenRows أولاً "
+                "للصفحات المحمية (مثل سلة + Cloudflare). المفتاح من `ZENROWS_API_KEY`."
+            )
+        else:
+            st.caption(
+                "💡 متاجر سلة/Cloudflare: عيّن `ZENROWS_API_KEY` في البيئة أو Streamlit secrets لتفعيل ZenRows تلقائياً."
+            )
+    except Exception:
+        pass
 
     # سطر واحد بدون تكرار اسم المتجر (كان يظهر في current_store وفي message معًا)
     st.info(state.get("message") or "—")
