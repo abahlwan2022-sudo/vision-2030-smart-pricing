@@ -1,27 +1,31 @@
-# Streamlit app — build context must be this project root (no `merged/` folder required).
-FROM python:3.12-slim-bookworm
+# Use an official Python runtime as a parent image
+FROM python:3.10-slim
 
-WORKDIR /app
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
 
-# Railway: أنشئ Volume واضبط Mount path = /data (أو أي مسار؛ عرّف نفس القيمة في Variables كـ DATA_DIR).
-ENV DATA_DIR=/data
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
-
+# Install system dependencies for compiling packages and runtime libs
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
     gcc \
-    g++ \
-    libffi-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Set work directory
+WORKDIR /app
+
+# Install dependencies
 COPY requirements.txt .
+RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy project
 COPY . .
 
+# Expose port (Streamlit default)
 EXPOSE 8501
 
-# تشغيل افتراضي؛ railway.json يضبط نفس الأمر في deploy.startCommand
-CMD ["python3", "docker_entrypoint.py"]
+# Command to run the application using the entrypoint script
+CMD ["python", "docker_entrypoint.py"]
