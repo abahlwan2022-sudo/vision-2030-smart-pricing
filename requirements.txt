@@ -1,21 +1,44 @@
+# ══════════════════════════════════════════════════════
+#  Vision2030 Smart Pricing — requirements.txt v2.0
+#  محدَّث لدعم الكاشط الذكي (Crawl4AI + Gemini + Stealth)
+# ══════════════════════════════════════════════════════
+
+# ── Core Streamlit ───────────────────────────────────
 streamlit==1.55.0
-pandas==2.3.3
-# مطلوب لـ utils/salla_shamel_export.py و engines/reconciliation_engine.py (تصدير .xlsx)
-openpyxl==3.1.5
-# مطلوب لـ engines/reconciliation_engine.py (fuzzy matching)
-rapidfuzz==3.14.3
-requests==2.33.0
-plotly==6.6.0
 streamlit-autorefresh>=1.0.1
-aiohttp==3.13.3
-cloudscraper>=1.2.71
-beautifulsoup4>=4.12.0
-google-generativeai
-curl_cffi>=0.7.0
+
+# ── Data ─────────────────────────────────────────────
+pandas==2.3.3
+# مطلوب لـ utils/salla_shamel_export.py و engines/reconciliation_engine.py
+openpyxl==3.1.5
 # مطلوب لـ engines/reconciliation_engine.py (matrix operations)
 numpy>=1.26.0
+plotly==6.6.0
 
+# ── HTTP / Networking ─────────────────────────────────
+requests==2.33.0
+aiohttp==3.13.3
+
+# ── Stealth Scraping — الكشط الذكي الطبقي ────────────
+# الطبقة 1: Playwright stealth — يتعامل مع JavaScript الكامل + fingerprinting
+crawl4ai>=0.4.0
+
+# الطبقة 2: TLS/JA3 fingerprint — محاكاة Chrome 120 على مستوى بروتوكول الشبكة
 curl_cffi==0.7.1
-google-generativeai==0.7.2
-pydantic>=2.0.0
+
+# الطبقة 3: Cloudflare JS challenge solver
+cloudscraper>=1.2.71
+
+# HTML parsing
 beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# ── AI / Gemini ──────────────────────────────────────
+google-generativeai==0.7.2
+
+# ── Matching / Fuzzy ─────────────────────────────────
+# مطلوب لـ engines/reconciliation_engine.py
+rapidfuzz==3.14.3
+
+# ── Validation ───────────────────────────────────────
+pydantic>=2.0.0
