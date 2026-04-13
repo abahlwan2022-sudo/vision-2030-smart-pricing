@@ -240,7 +240,8 @@ def run_worker_loop() -> None:
     _write_json(STATE_FILE, state)
     _write_json(PID_FILE, {"pid": os.getpid(), "started_at": _now_iso()})
 
-    scraper = SmartAIScraper(concurrency=1, delay_between=0.0)
+    # وضع صلب جداً: retries أعلى + timeout أعلى لتقليل الفشل لأدنى حد.
+    scraper = SmartAIScraper(concurrency=1, delay_between=0.0, timeout=45, max_retries=6)
 
     try:
         for i, comp in enumerate(DEFAULT_COMPETITORS):
@@ -293,12 +294,25 @@ def run_worker_loop() -> None:
                     return
 
                 try:
-                    res = scraper.scrape_url_sync(url)
-                    save_results_to_db([res])
-                    if res.success:
-                        store_success += 1
-                    else:
-                        store_errors += 1
+                    # Outer retries على مستوى الرابط بالكامل (بالإضافة إلى retries داخل SmartAIScraper).
+                    final_res = None
+                    for outer_try in range(1, 4):
+                        res = scraper.scrape_url_sync(url)
+                        final_res = res
+                        if res.success:
+                            break
+                        if outer_try < 3:
+                            time.sleep(7 * outer_try)
+
+                    if final_res is not None:
+                        save_results_to_db([final_res])
+                        if final_res.success:
+                            store_success += 1
+                        else:
+                            store_errors += 1
+                            state = read_state()
+                            state["last_error"] = f"{comp['name']}: {str(final_res.error)[:250]}"
+                            _write_json(STATE_FILE, state)
                 except Exception as exc:
                     store_errors += 1
                     state = read_state()

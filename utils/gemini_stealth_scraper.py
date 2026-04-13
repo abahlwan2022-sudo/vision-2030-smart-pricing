@@ -24,6 +24,7 @@ import logging
 import re
 import time
 import threading
+import random
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -188,6 +189,26 @@ def _call_gemini(page_content: str, url: str = "") -> Optional[Dict[str, str]]:
     except Exception as e:
         logger.error(f"❌ خطأ في Gemini API: {e}")
         return None
+
+
+def _call_gemini_with_retries(
+    page_content: str,
+    url: str = "",
+    retries: int = 3,
+) -> Optional[Dict[str, str]]:
+    """
+    استدعاء Gemini مع إعادة المحاولة لتقليل الفشل قدر الإمكان.
+    """
+    for attempt in range(1, max(1, retries) + 1):
+        parsed = _call_gemini(page_content=page_content, url=url)
+        if parsed:
+            return parsed
+        # Backoff متدرج لتجاوز الازدحام/الـ transient failures
+        if attempt < retries:
+            wait_s = min(8.0, 1.5 * attempt + random.uniform(0.1, 0.8))
+            logger.warning("Gemini retry %s/%s for %s (sleep %.1fs)", attempt, retries, url[:80], wait_s)
+            time.sleep(wait_s)
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -415,10 +436,12 @@ class SmartAIScraper:
         concurrency: int = 3,
         delay_between: float = 1.0,
         timeout: int = 25,
+        max_retries: int = 3,
     ):
         self.concurrency     = max(1, min(concurrency, 10))
         self.delay_between   = max(0.0, delay_between)
         self.timeout         = timeout
+        self.max_retries     = max(1, min(max_retries, 8))
         self._semaphore: Optional[asyncio.Semaphore] = None
 
     # ── دالة الكشط الواحد (async) ────────────────────────────────────────
@@ -436,72 +459,80 @@ class SmartAIScraper:
             result.error = "رابط غير صحيح — يجب أن يبدأ بـ http أو https"
             return result
 
-        page_content: Optional[str] = None
-        method_used:  str           = ""
+        last_error = "فشل غير معروف"
+        for attempt in range(1, self.max_retries + 1):
+            attempt_timeout = int(self.timeout + (attempt - 1) * 8)
+            page_content: Optional[str] = None
+            method_used: str = ""
 
-        # ① Crawl4AI ──────────────────────────────────────────────────────
-        page_content = await _fetch_crawl4ai(url, timeout=self.timeout)
-        if page_content:
-            method_used = "crawl4ai"
-
-        # ② curl_cffi ─────────────────────────────────────────────────────
-        if not page_content:
-            loop = asyncio.get_event_loop()
-            page_content = await loop.run_in_executor(
-                None, _fetch_curl_cffi, url, self.timeout
-            )
+            # ① Crawl4AI ──────────────────────────────────────────────────
+            page_content = await _fetch_crawl4ai(url, timeout=attempt_timeout)
             if page_content:
-                method_used = "curl_cffi"
+                method_used = "crawl4ai"
 
-        # ③ cloudscraper ──────────────────────────────────────────────────
-        if not page_content:
+            # ② curl_cffi ─────────────────────────────────────────────────
+            if not page_content:
+                loop = asyncio.get_event_loop()
+                page_content = await loop.run_in_executor(
+                    None, _fetch_curl_cffi, url, attempt_timeout
+                )
+                if page_content:
+                    method_used = "curl_cffi"
+
+            # ③ cloudscraper ──────────────────────────────────────────────
+            if not page_content:
+                loop = asyncio.get_event_loop()
+                page_content = await loop.run_in_executor(
+                    None, _fetch_cloudscraper, url, attempt_timeout
+                )
+                if page_content:
+                    method_used = "cloudscraper"
+
+            # ④ requests ──────────────────────────────────────────────────
+            if not page_content:
+                loop = asyncio.get_event_loop()
+                page_content = await loop.run_in_executor(
+                    None, _fetch_requests, url, attempt_timeout
+                )
+                if page_content:
+                    method_used = "requests"
+
+            if not page_content:
+                last_error = "فشل جلب الصفحة بكل الطرق المتاحة"
+                if attempt < self.max_retries:
+                    await asyncio.sleep(min(10.0, 2.0 * attempt))
+                continue
+
+            # ── استدعاء Gemini مع retries ────────────────────────────────
             loop = asyncio.get_event_loop()
-            page_content = await loop.run_in_executor(
-                None, _fetch_cloudscraper, url, self.timeout
+            gemini_result = await loop.run_in_executor(
+                None, _call_gemini_with_retries, page_content, url, 3
             )
-            if page_content:
-                method_used = "cloudscraper"
 
-        # ④ requests ──────────────────────────────────────────────────────
-        if not page_content:
-            loop = asyncio.get_event_loop()
-            page_content = await loop.run_in_executor(
-                None, _fetch_requests, url, self.timeout
-            )
-            if page_content:
-                method_used = "requests"
+            if not gemini_result:
+                last_error = "Gemini فشل في تحليل الصفحة"
+                if attempt < self.max_retries:
+                    await asyncio.sleep(min(10.0, 2.5 * attempt))
+                continue
 
-        # فشل كل الطبقات
-        if not page_content:
-            result.error         = "فشل جلب الصفحة بكل الطرق المتاحة"
-            result.scrape_method = "none"
-            return result
-
-        # ── استدعاء Gemini ────────────────────────────────────────────────
-        loop = asyncio.get_event_loop()
-        gemini_result = await loop.run_in_executor(
-            None, _call_gemini, page_content, url
-        )
-
-        if not gemini_result:
-            result.error         = "Gemini فشل في تحليل الصفحة"
+            # ── تعبئة النتيجة ─────────────────────────────────────────────
+            result.title = gemini_result.get("title", "")
+            result.price = gemini_result.get("price", "0")
+            result.stock_status = gemini_result.get("stock_status", "unknown")
             result.scrape_method = method_used
+            result.success = True
+
+            # تحويل السعر لرقم عشري
+            price_clean = re.sub(r"[^\d.]", "", result.price)
+            try:
+                result.raw_price_float = float(price_clean) if price_clean else 0.0
+            except ValueError:
+                result.raw_price_float = 0.0
+
             return result
 
-        # ── تعبئة النتيجة ─────────────────────────────────────────────────
-        result.title        = gemini_result.get("title", "")
-        result.price        = gemini_result.get("price", "0")
-        result.stock_status = gemini_result.get("stock_status", "unknown")
-        result.scrape_method = method_used
-        result.success      = True
-
-        # تحويل السعر لرقم عشري
-        price_clean = re.sub(r"[^\d.]", "", result.price)
-        try:
-            result.raw_price_float = float(price_clean) if price_clean else 0.0
-        except ValueError:
-            result.raw_price_float = 0.0
-
+        result.error = last_error
+        result.scrape_method = result.scrape_method or "none"
         return result
 
     # ── دالة الكشط مع semaphore ──────────────────────────────────────────
