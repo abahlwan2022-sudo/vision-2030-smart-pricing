@@ -87,6 +87,14 @@ def _domain(url: str) -> str:
         return url
 
 
+def _effective_concurrency() -> int:
+    """قيمة التزامن بدون تعديل مفتاح widget فعّال."""
+    try:
+        return int(st.session_state.get("sc_concurrency_adv", 6))
+    except Exception:
+        return 6
+
+
 def _load_stores() -> list:
     try:
         with open(_COMPETITORS_FILE, encoding="utf-8") as f:
@@ -361,7 +369,7 @@ def show() -> None:
                 for s in stores:
                     d = _domain(s)
                     if not _is_thread_alive(d):
-                        _launch_store(s, concurrency=int(st.session_state.get("sc_concurrency", 6)))
+                        _launch_store(s, concurrency=_effective_concurrency())
                 st.success("✅ بدأ الكشط لكل المتاجر")
                 st.rerun()
         with bb:
@@ -453,13 +461,13 @@ def show() -> None:
                     use_container_width=True,
                 ):
                     _launch_store(store_url,
-                                  concurrency=int(st.session_state.get("sc_concurrency", 6)))
+                                  concurrency=_effective_concurrency())
                     st.rerun()
             with c2:
                 if st.button("🔁 إعادة", key=f"re_{domain}", disabled=_disabled_run, use_container_width=True):
                     _reset_store(domain)
                     _launch_store(store_url, force=True,
-                                  concurrency=int(st.session_state.get("sc_concurrency", 6)))
+                                  concurrency=_effective_concurrency())
                     st.rerun()
             with c3:
                 if st.button("⏭️ تخطي", key=f"skip_{domain}", disabled=_disabled_run, use_container_width=True):
@@ -503,7 +511,9 @@ def show() -> None:
                 result = _read_result(domain)
                 msg = (result or {}).get("message", err)
                 if msg and msg != "skipped":
-                    st.error(f"❌ {domain}: {msg[:200]}")
+                    if str(msg).strip().startswith("✅ 0 منتج"):
+                        msg = "لم يتم استخراج منتجات جديدة في هذه الدورة (غالباً حظر/timeout/قيود الموقع)."
+                    st.error(f"❌ {domain}: {str(msg)[:200]}")
 
     # ══════════════════════════════════════════════════════════════════════
     #  تبويب 2: إضافة منافس
@@ -537,7 +547,7 @@ def show() -> None:
                     _save_stores(stores)
                     if start_now:
                         _launch_store(new_url,
-                                      concurrency=int(st.session_state.get("sc_concurrency", 6)),
+                                      concurrency=_effective_concurrency(),
                                       max_products=int(max_p))
                         st.success(f"✅ أُضيف {domain} وبدأ الكشط تلقائياً!")
                     else:
@@ -670,11 +680,12 @@ def show() -> None:
     with tab_settings:
         st.markdown("### ⚙️ إعدادات الكشط")
 
-        st.session_state["sc_concurrency"] = st.slider(
+        st.slider(
             "التزامن (Concurrency) — عدد الطلبات المتزامنة",
             min_value=2, max_value=20,
-            value=int(st.session_state.get("sc_concurrency", 6)),
+            value=int(st.session_state.get("sc_concurrency_adv", 6)),
             step=1,
+            key="sc_concurrency_adv",
             help="قيمة أقل = أبطأ لكن أأمن من الحجب | قيمة أعلى = أسرع لكن خطر حجب أكبر"
         )
 
@@ -716,7 +727,7 @@ def show() -> None:
                     for s in _load_stores():
                         d = _domain(s)
                         if not _is_thread_alive(d):
-                            _launch_store(s, concurrency=int(st.session_state.get("sc_concurrency", 6)))
+                            _launch_store(s, concurrency=_effective_concurrency())
                     st.success("✅ بدأ الكشط الفوري")
                     st.rerun()
 
