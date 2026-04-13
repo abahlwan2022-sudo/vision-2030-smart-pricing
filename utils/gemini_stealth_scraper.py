@@ -2,6 +2,7 @@
 utils/gemini_stealth_scraper.py — محرك الكشط الذكي v2.0
 ══════════════════════════════════════════════════════════
 طبقات دفاعية متعددة لتجاوز حماية البوتات:
+  ⓪ ZenRows (اختياري) ← عند ضبط ZENROWS_API_KEY يُجرّب أولاً
   ① Crawl4AI + Playwright Stealth  ← يتعامل مع JS الكامل وfingerprinting
   ② curl_cffi + chrome impersonation ← TLS/JA3 fingerprint كامل
   ③ cloudscraper ← حماية Cloudflare layer
@@ -98,7 +99,7 @@ class ScrapeResult:
     stock_status:    str   = "unknown"      # in_stock | out_of_stock | unknown
     success:         bool  = False
     error:           str   = ""
-    scrape_method:   str   = ""             # crawl4ai | curl_cffi | cloudscraper | requests
+    scrape_method:   str   = ""             # zenrows | crawl4ai | curl_cffi | cloudscraper | requests
     domain:          str   = ""
     raw_price_float: float = 0.0
     competitor:      str   = ""
@@ -430,6 +431,44 @@ def _fetch_curl_cffi(url: str, timeout: int = 20) -> Optional[str]:
         return None
 
 
+# ── ZenRows (وكيل جلب — اختياري عبر ZENROWS_API_KEY) ─────────────────────
+def _zenrows_config() -> Tuple[str, str]:
+    try:
+        from config import ZENROWS_API_KEY, ZENROWS_MODE
+
+        key = (ZENROWS_API_KEY or "").strip()
+        mode = (ZENROWS_MODE or "auto").strip() or "auto"
+        return key, mode
+    except ImportError:
+        import os
+
+        return (
+            os.environ.get("ZENROWS_API_KEY", "").strip(),
+            (os.environ.get("ZENROWS_MODE", "auto") or "auto").strip(),
+        )
+
+
+def _fetch_zenrows(url: str, api_key: str, mode: str, timeout: int = 45) -> Optional[str]:
+    """يجلب HTML عبر واجهة ZenRows (مناسب لمتاجر سلة + Cloudflare)."""
+    if not api_key or not url.startswith("http"):
+        return None
+    try:
+        import requests
+
+        resp = requests.get(
+            "https://api.zenrows.com/v1/",
+            params={"url": url, "apikey": api_key, "mode": mode or "auto"},
+            timeout=max(timeout, 15),
+        )
+        if resp.status_code == 200 and (resp.text or "").strip():
+            logger.info("✅ zenrows جلب %s", url[:60])
+            return _clean_html_for_llm(resp.text)
+        logger.warning("⚠️ zenrows: HTTP %s لـ %s", resp.status_code, url[:60])
+    except Exception as e:
+        logger.warning("⚠️ zenrows خطأ: %r", e)
+    return None
+
+
 # ── الطبقة 3: cloudscraper ───────────────────────────────────────────────
 def _fetch_cloudscraper(url: str, timeout: int = 25) -> Optional[str]:
     """يتجاوز حماية Cloudflare عبر حل JavaScript challenges."""
@@ -516,7 +555,7 @@ class SmartAIScraper:
     async def _scrape_url_async(self, url: str) -> ScrapeResult:
         """
         يكشط URL واحد مع تدرج بين الطبقات:
-        Crawl4AI → curl_cffi → cloudscraper → requests
+        ZenRows (إن وُجد مفتاح) → Crawl4AI → curl_cffi → cloudscraper → requests
         ثم يُمرر النص لـ Gemini.
         """
         url     = url.strip()
@@ -533,10 +572,21 @@ class SmartAIScraper:
             page_content: Optional[str] = None
             method_used: str = ""
 
+            # ⓪ ZenRows — أولوية عند توفر ZENROWS_API_KEY
+            z_key, z_mode = _zenrows_config()
+            if z_key:
+                loop = asyncio.get_event_loop()
+                page_content = await loop.run_in_executor(
+                    None, _fetch_zenrows, url, z_key, z_mode, attempt_timeout
+                )
+                if page_content:
+                    method_used = "zenrows"
+
             # ① Crawl4AI ──────────────────────────────────────────────────
-            page_content = await _fetch_crawl4ai(url, timeout=attempt_timeout)
-            if page_content:
-                method_used = "crawl4ai"
+            if not page_content:
+                page_content = await _fetch_crawl4ai(url, timeout=attempt_timeout)
+                if page_content:
+                    method_used = "crawl4ai"
 
             # ② curl_cffi ─────────────────────────────────────────────────
             if not page_content:
