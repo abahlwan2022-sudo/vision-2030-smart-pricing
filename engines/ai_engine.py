@@ -509,10 +509,12 @@ def _search_ddg(query, num_results=5):
 
 
 def ai_fallback_scrape(html_content: str, url: str) -> dict:
-    # مسار AI مخصص للكشط: يعتمد مفاتيح config (Railway env) فقط
+    """
+    كشط احتياطي عبر AI: نفس سلسلة المزودين (Gemini → OpenRouter → Cohere) مثل بقية التطبيق.
+    """
     try:
-        if not GEMINI_API_KEYS:
-            return {"error": "Missing Gemini keys in environment"}
+        if not GEMINI_API_KEYS and not (OPENROUTER_API_KEY or "").strip() and not (COHERE_API_KEY or "").strip():
+            return {"error": "No AI keys configured (GEMINI_*, OPENROUTER_API_KEY, or COHERE_API_KEY)"}
 
         # 1) تنظيف HTML لتقليل التكلفة وتسريع الاستجابة
         soup = BeautifulSoup(html_content, "html.parser")
@@ -537,15 +539,20 @@ def ai_fallback_scrape(html_content: str, url: str) -> dict:
         2. النص: {clean_text}
         """
 
+        sys_json = "أرجع JSON فقط بدون شرح."
         response_text = _call_gemini(
             prompt,
-            system="أرجع JSON فقط بدون شرح.",
+            system=sys_json,
             grounding=False,
             temperature=0.2,
             max_tokens=1024,
         )
         if not response_text:
-            return {"error": "Gemini returned empty response"}
+            response_text = _call_openrouter(prompt, system=sys_json)
+        if not response_text:
+            response_text = _call_cohere(prompt, system=sys_json)
+        if not response_text:
+            return {"error": "Empty response from all AI providers"}
 
         # 3) استخراج JSON بأمان حتى مع أي نص إضافي
         match = re.search(r"\{.*\}", response_text, re.DOTALL)
