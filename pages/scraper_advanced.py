@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
+from utils.background_agent import is_daemon_running, read_state, start_daemon, stop_daemon
 
 # ── مسارات ─────────────────────────────────────────────────────────────────
 _DATA_DIR         = os.environ.get("DATA_DIR", "data")
@@ -37,6 +38,7 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 
 _STATE_LOCK  = threading.Lock()
 _RESULT_LOCK = threading.Lock()
+_DAEMON_STATE_FILE = os.path.join(_DATA_DIR, "daemon_state.json")
 
 # ════════════════════════════════════════════════════════════════════════════
 #  CSS موحَّد للتبويبَين
@@ -377,10 +379,82 @@ def _run_ai_scraping_job(urls: List[str], concurrency: int,
         st.session_state[f"{session_key}_running"] = False
 
 
+def _render_full_auto_daemon_ui() -> None:
+    st.markdown("## 🤖 One-Click Automated AI Scraping Daemon")
+    st.caption("Runs in a detached background process and keeps scraping even if this page reruns.")
+
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=2500, key="full_auto_daemon_refresh")
+    except Exception:
+        pass
+
+    state = read_state()
+    running = bool(state.get("running")) or is_daemon_running()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("▶️ Start Full Auto-Scraping Daemon", type="primary", use_container_width=True):
+            result = start_daemon()
+            if result.get("ok"):
+                st.success(f"Daemon started (PID: {result.get('pid')})")
+            else:
+                st.warning(result.get("message", "Unable to start daemon."))
+            st.rerun()
+    with c2:
+        if st.button("⏹️ Stop", use_container_width=True):
+            result = stop_daemon()
+            st.warning(result.get("message", "Stop requested."))
+            st.rerun()
+
+    st.markdown("---")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Status", "🟢 Running" if running else "⚫ Idle")
+    k2.metric("Stores", f"{int(state.get('stores_done', 0))}/{int(state.get('stores_total', 18))}")
+    k3.metric("Products", f"{int(state.get('products_done', 0))}/{int(state.get('products_total', 0))}")
+    k4.metric("Success / Errors", f"{int(state.get('success_count', 0))} / {int(state.get('error_count', 0))}")
+
+    st.info(
+        f"Current: {state.get('current_store') or '—'} | "
+        f"Message: {state.get('message') or '—'} | "
+        f"Last update: {state.get('updated_at') or '—'}"
+    )
+
+    if state.get("last_error"):
+        st.error(f"Last error: {state.get('last_error')}")
+
+    stores = state.get("stores", [])
+    if stores:
+        rows = []
+        for item in stores:
+            rows.append(
+                {
+                    "المتجر": item.get("name", ""),
+                    "الحالة": item.get("status", "pending"),
+                    "المنتجات": f"{int(item.get('products_done', 0))}/{int(item.get('products_total', 0))}",
+                    "ناجحة": int(item.get("success_count", 0)),
+                    "فاشلة": int(item.get("error_count", 0)),
+                    "آخر خطأ": item.get("last_error", ""),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, height=420)
+
+    if os.path.exists(_DAEMON_STATE_FILE):
+        with st.expander("Raw daemon state (JSON)"):
+            try:
+                with open(_DAEMON_STATE_FILE, encoding="utf-8") as f:
+                    st.code(f.read(), language="json")
+            except Exception as ex:
+                st.error(str(ex))
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  الواجهة الرئيسية الموحَّدة
 # ════════════════════════════════════════════════════════════════════════════
 def show(embedded: bool = False) -> None:
+    _render_full_auto_daemon_ui()
+    return
+
     st.markdown(_CSS, unsafe_allow_html=True)
 
     # ── Auto-Refresh ──────────────────────────────────────────────────────
@@ -757,7 +831,7 @@ def show(embedded: bool = False) -> None:
                         size = f" ({sz//1024} KB)" if sz > 1024 else f" ({sz} B)"
                     except Exception:
                         pass
-                st.caption(f"{"✅" if os.path.exists(fp) else "❌"} **{label}**: `{fp}`{size}")
+                st.caption(f"{'✅' if os.path.exists(fp) else '❌'} **{label}**: `{fp}`{size}")
 
     # ════════════════════════════════════════════════════════════════════════
     #  تبويب 2 — الكشط الذكي AI
