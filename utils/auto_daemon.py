@@ -16,6 +16,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 STATE_FILE = DATA_DIR / "daemon_state.json"
 PID_FILE = DATA_DIR / "daemon_pid.json"
 STOP_FILE = DATA_DIR / "daemon_stop.flag"
+OUTPUT_CSV = DATA_DIR / "competitors_latest.csv"
 
 STRICT_DELAY_SECONDS = 5
 
@@ -194,6 +195,40 @@ def _mark_store_state(state: Dict[str, Any], store_idx: int, **updates: Any) -> 
     return state
 
 
+def _refresh_output_csv_from_db() -> None:
+    """
+    يحدّث ملف competitors_latest.csv تلقائياً من جدول التراكم في SQLite
+    حتى يكون جاهزاً مباشرة لصفحة التحليل (Dashboard Auto Bridge).
+    """
+    try:
+        import pandas as pd
+        from utils.db_manager import get_all_competitor_products
+
+        rows = get_all_competitor_products("")
+        if not rows:
+            return
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return
+
+        rename_map = {
+            "competitor": "store",
+            "product_name": "name",
+            "price": "price",
+            "product_url": "product_url",
+            "image_url": "image_url",
+            "brand": "brand",
+            "updated_at": "updated_at",
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        _ensure_data_dir()
+        df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    except Exception:
+        # لا نوقف الكاشط إذا فشل التصدير — الكشط نفسه أهم.
+        pass
+
+
 def run_worker_loop() -> None:
     from utils.gemini_stealth_scraper import SmartAIScraper, save_results_to_db
 
@@ -300,6 +335,7 @@ def run_worker_loop() -> None:
                 error_count=store_errors,
             )
             _write_json(STATE_FILE, state)
+            _refresh_output_csv_from_db()
 
         state = read_state()
         state["running"] = False
@@ -307,6 +343,7 @@ def run_worker_loop() -> None:
         state["message"] = "full auto-scraping daemon completed"
         state["finished_at"] = _now_iso()
         _write_json(STATE_FILE, state)
+        _refresh_output_csv_from_db()
     except Exception as exc:
         state = read_state()
         state["running"] = False
