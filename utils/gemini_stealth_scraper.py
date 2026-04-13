@@ -33,29 +33,55 @@ from urllib.parse import urlparse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("SmartAIScraper")
 
-# ── استيراد آمن لـ config ───────────────────────────────────────────────────
-try:
-    from config import GEMINI_API_KEYS, GEMINI_MODEL
-    _GEMINI_KEYS: List[str] = list(GEMINI_API_KEYS) if GEMINI_API_KEYS else []
-    _GEMINI_MODEL: str = GEMINI_MODEL or "gemini-2.0-flash"
-except ImportError:
-    import os
-    _raw = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEYS", "")
-    _GEMINI_KEYS = [_raw] if _raw else []
-    _GEMINI_MODEL = "gemini-2.0-flash"
-
-# ── مؤشر دوران مفاتيح Gemini ────────────────────────────────────────────────
+# ── مفاتيح Gemini لمسار SDK الاحتياطي (يُحدَّث من config عند كل استدعاء) ───
 _KEY_LOCK  = threading.Lock()
 _KEY_INDEX = 0
 
 
+def _refresh_sdk_keys() -> List[str]:
+    """نفس منطق config — حتى يعمل الكشط بعد تحميل الأسرار لاحقاً."""
+    try:
+        from config import GEMINI_API_KEYS
+
+        return [k.strip() for k in (GEMINI_API_KEYS or []) if k and len(str(k).strip()) > 20]
+    except ImportError:
+        import os
+
+        keys: List[str] = []
+        raw = (os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEYS", "")).strip()
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    keys = [str(k).strip() for k in parsed if k]
+            except Exception:
+                keys = [k.strip() for k in raw.strip("[]").replace('"', "").split(",") if k.strip()]
+        elif raw:
+            keys = [raw]
+        for i in range(1, 10):
+            k = os.environ.get(f"GEMINI_KEY_{i}", "").strip()
+            if len(k) > 20:
+                keys.append(k)
+        return list(dict.fromkeys(keys))
+
+
+def _gemini_model_name() -> str:
+    try:
+        from config import GEMINI_MODEL
+
+        return (GEMINI_MODEL or "gemini-2.0-flash").strip()
+    except ImportError:
+        return "gemini-2.0-flash"
+
+
 def _get_next_gemini_key() -> str:
-    """يدور على مفاتيح Gemini بشكل thread-safe."""
+    """يدور على مفاتيح Gemini بشكل thread-safe (للمسار SDK فقط)."""
     global _KEY_INDEX
-    if not _GEMINI_KEYS:
+    keys = _refresh_sdk_keys()
+    if not keys:
         return ""
     with _KEY_LOCK:
-        key = _GEMINI_KEYS[_KEY_INDEX % len(_GEMINI_KEYS)]
+        key = keys[_KEY_INDEX % len(keys)]
         _KEY_INDEX += 1
     return key
 
@@ -130,65 +156,107 @@ _GEMINI_PROMPT_TEMPLATE = """\
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
+_SCRAPE_JSON_SYSTEM = (
+    "أرجع JSON فقط بالمفاتيح title و price و stock_status "
+    "(stock_status واحد من: in_stock | out_of_stock | unknown). بدون markdown أو شرح."
+)
 
-def _call_gemini(page_content: str, url: str = "") -> Optional[Dict[str, str]]:
-    """
-    يرسل محتوى الصفحة لـ Gemini ويعيد dict صارم:
-      {"title": ..., "price": ..., "stock_status": ...}
-    يعيد None عند أي فشل.
-    """
-    api_key = _get_next_gemini_key()
-    if not api_key:
-        logger.error("لا يوجد مفتاح Gemini API")
+
+def _normalize_product_dict(data: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    if not isinstance(data, dict):
+        return None
+    result = {
+        "title":        str(data.get("title", "")).strip(),
+        "price":        str(data.get("price", "0")).strip(),
+        "stock_status": str(data.get("stock_status", "unknown")).strip().lower(),
+    }
+    if result["stock_status"] not in ("in_stock", "out_of_stock", "unknown"):
+        result["stock_status"] = "unknown"
+    return result
+
+
+def _parse_json_product_response(raw_text: str) -> Optional[Dict[str, str]]:
+    """يستخرج {title, price, stock_status} من نص نموذج لغوي."""
+    if not raw_text or not str(raw_text).strip():
+        return None
+    try:
+        t = str(raw_text).strip()
+        fence_match = _JSON_FENCE_RE.search(t)
+        if fence_match:
+            t = fence_match.group(1).strip()
+        json_match = re.search(r"\{.*\}", t, re.DOTALL)
+        if json_match:
+            t = json_match.group(0)
+        data = json.loads(t)
+        out = _normalize_product_dict(data)
+        if out:
+            logger.info("✅ LLM استخرج: %s | %s", out["title"][:50], out["price"])
+        return out
+    except json.JSONDecodeError as e:
+        logger.warning("❌ استجابة LLM ليست JSON صالحاً: %s", e)
+        return None
+    except Exception as e:
+        logger.warning("❌ فشل تحليل JSON من LLM: %s", e)
         return None
 
+
+def _call_gemini_sdk_raw(page_content: str) -> Optional[str]:
+    """احتياطي: Google Generative AI SDK عند عدم توفر/فشل مسار ai_engine."""
+    api_key = _get_next_gemini_key()
+    if not api_key:
+        return None
     try:
         import google.generativeai as genai
+
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(_GEMINI_MODEL)
-
-        # اقتصار المحتوى على 12000 حرف لتجنب تجاوز نافذة السياق
+        model = genai.GenerativeModel(_gemini_model_name())
         truncated = page_content[:12_000]
-        prompt    = _GEMINI_PROMPT_TEMPLATE.format(page_content=truncated)
-
+        prompt = _GEMINI_PROMPT_TEMPLATE.format(page_content=truncated)
         response = model.generate_content(
             prompt,
             generation_config=genai.GenerationConfig(temperature=0.05),
         )
-        raw_text = (response.text or "").strip()
-
-        # محاولة نزع code fence
-        fence_match = _JSON_FENCE_RE.search(raw_text)
-        if fence_match:
-            raw_text = fence_match.group(1).strip()
-
-        # تنظيف أي نص قبل/بعد الـ JSON
-        json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-        if json_match:
-            raw_text = json_match.group(0)
-
-        data = json.loads(raw_text)
-
-        # تطبيع
-        result = {
-            "title":        str(data.get("title", "")).strip(),
-            "price":        str(data.get("price", "0")).strip(),
-            "stock_status": str(data.get("stock_status", "unknown")).strip().lower(),
-        }
-
-        # التحقق من stock_status
-        if result["stock_status"] not in ("in_stock", "out_of_stock", "unknown"):
-            result["stock_status"] = "unknown"
-
-        logger.info(f"✅ Gemini استخرج: {result['title'][:50]} | {result['price']}")
-        return result
-
-    except json.JSONDecodeError as e:
-        logger.warning(f"❌ Gemini أعاد JSON غير صحيح: {e}")
+        return (response.text or "").strip()
+    except ImportError:
+        logger.debug("حزمة google-generativeai غير مثبتة — تخطي مسار SDK")
         return None
     except Exception as e:
-        logger.error(f"❌ خطأ في Gemini API: {e}")
+        logger.warning("مسار Gemini SDK: %s", e)
         return None
+
+
+def _call_gemini(page_content: str, url: str = "") -> Optional[Dict[str, str]]:
+    """
+    يمرّر المحتوى عبر نفس سلسلة مزودي التطبيق (Gemini REST → OpenRouter → Cohere)
+    ثم يحلّل JSON. يعود لـ Gemini SDK إذا لزم.
+    """
+    truncated = page_content[:12_000]
+    prompt = _GEMINI_PROMPT_TEMPLATE.format(page_content=truncated)
+    raw_text: Optional[str] = None
+
+    try:
+        from engines.ai_engine import _call_cohere, _call_gemini as _ai_gemini_rest, _call_openrouter
+
+        raw_text = _ai_gemini_rest(
+            prompt, system=_SCRAPE_JSON_SYSTEM, grounding=False, temperature=0.05, max_tokens=1024
+        )
+        if not raw_text:
+            raw_text = _call_openrouter(prompt, system=_SCRAPE_JSON_SYSTEM)
+        if not raw_text:
+            raw_text = _call_cohere(prompt, system=_SCRAPE_JSON_SYSTEM)
+    except ImportError as e:
+        logger.warning("تعذّر استيراد engines.ai_engine — سيتم استخدام Gemini SDK فقط: %s", e)
+    except Exception as e:
+        logger.warning("سلسلة ai_engine للكشط: %s", e)
+
+    if not raw_text:
+        raw_text = _call_gemini_sdk_raw(page_content)
+
+    if not raw_text:
+        logger.error("لا يوجد رد من أي مزود AI (راجع مفاتيح config / OPENROUTER / COHERE)")
+        return None
+
+    return _parse_json_product_response(raw_text)
 
 
 def _call_gemini_with_retries(

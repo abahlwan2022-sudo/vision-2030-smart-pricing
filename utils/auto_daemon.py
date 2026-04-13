@@ -257,7 +257,8 @@ def run_worker_loop() -> None:
             state = read_state()
             state["current_store"] = comp["name"]
             state["current_store_index"] = i + 1
-            state["message"] = f"resolving sitemap for {comp['name']}"
+            # لا نكرّر اسم المتجر هنا — موجود في current_store
+            state["message"] = "resolving sitemap"
             state = _mark_store_state(state, i, status="resolving")
             _write_json(STATE_FILE, state)
 
@@ -267,7 +268,7 @@ def run_worker_loop() -> None:
                 state = read_state()
                 state["error_count"] = int(state.get("error_count", 0)) + 1
                 state["last_error"] = f"{comp['name']}: {str(exc)[:250]}"
-                state["message"] = f"failed to resolve sitemap for {comp['name']}"
+                state["message"] = "failed to resolve sitemap"
                 state = _mark_store_state(
                     state, i, status="error", last_error=str(exc)[:250], products_total=0, products_done=0
                 )
@@ -277,7 +278,7 @@ def run_worker_loop() -> None:
             state = read_state()
             urls_total = len(urls)
             state["products_total"] = int(state.get("products_total", 0)) + urls_total
-            state["message"] = f"جاري الكشط: {comp['name']} — {urls_total} رابط منتج"
+            state["message"] = f"جاري الكشط — {urls_total} رابط منتج"
             state = _mark_store_state(state, i, status="running", products_total=urls_total, products_done=0)
             _write_json(STATE_FILE, state)
 
@@ -333,7 +334,7 @@ def run_worker_loop() -> None:
                         success_count=store_success,
                         error_count=store_errors,
                     )
-                    state["message"] = f"{idx}/{len(urls)} · {comp['name']}"
+                    state["message"] = f"{idx}/{len(urls)} منتج"
                     _write_json(STATE_FILE, state)
                     # نسخ احتياطي للملف كل 15 منتجًا (نجاح أو فشل) لتقليل التخلف عن قاعدة البيانات
                     if idx % 15 == 0:
@@ -344,7 +345,7 @@ def run_worker_loop() -> None:
             state["success_count"] = int(state.get("success_count", 0)) + store_success
             state["error_count"] = int(state.get("error_count", 0)) + store_errors
             state["stores_done"] = int(state.get("stores_done", 0)) + 1
-            state["message"] = f"completed {comp['name']}"
+            state["message"] = "اكتمل كشط المتجر"
             state = _mark_store_state(
                 state,
                 i,
