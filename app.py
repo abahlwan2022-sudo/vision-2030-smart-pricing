@@ -48,7 +48,7 @@ SECTIONS = [
     "🔍 منتجات مفقودة",
     "⚠️ تحت المراجعة",
     "⚪ مستبعد (لا يوجد تطابق)",
-    "✔️ تمت المعالجة",
+    "✅ تمت المعالجة",
     "⚡ أتمتة Make",
     "🔄 الأتمتة الذكية",
     "🕷️ كشط المنافسين",
@@ -70,7 +70,7 @@ from engines.ai_engine import (call_ai, verify_match, analyze_product,
                                 fetch_fragrantica_info, fetch_product_images,
                                 generate_mahwous_description, _parse_seo_json_block,
                                 reclassify_review_items, ai_deep_analysis,
-                                generate_seo_description)
+                                generate_seo_description, generate_action_summary)
 from engines.analysis_job_runner import run_analysis_background_job as _run_analysis_background
 from engines.reconciliation_engine import (
     failed_rows_to_csv_bytes,
@@ -90,7 +90,6 @@ from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
                             fetch_page_title_from_url)
 from utils.make_helper import (send_price_updates, send_new_products,
                                 send_missing_products, send_single_product,
-                                trigger_price_update,
                                 verify_webhook_connection, export_to_make_format,
                                 send_batch_smart)
 from utils.salla_shamel_export import (
@@ -269,6 +268,10 @@ _defaults = {
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+st.session_state.setdefault("processed_price_skus", set())  # FIX: Smart Workflow & AI Tracking
+st.session_state.setdefault("processed_missing_urls", set())  # FIX: Smart Workflow & AI Tracking
+# FIX: Relaxed Constraints — التراكم دائم افتراضياً لحماية النتائج السابقة من الفقد.
+st.session_state["dash_accumulate_results"] = True
 
 # تحميل المنتجات المخفية من قاعدة البيانات عند كل تشغيل
 _db_hidden = get_hidden_product_keys()
@@ -475,6 +478,56 @@ def _effective_column_map(df: pd.DataFrame, key_prefix: str):
     }
 
 
+def _resolve_catalog_columns_relaxed(df: pd.DataFrame) -> dict:
+    """
+    FIX: Relaxed Constraints — fallback مرن لاختيار أعمدة الاسم/السعر/المعرف
+    لضمان حفظ الكتالوج حتى لو فشل التعرف الصارم.
+    """
+    from engines.engine import resolve_catalog_columns
+    base = resolve_catalog_columns(df) if df is not None else {}
+    if df is None or df.empty:
+        return {"name": None, "price": None, "id": None, "img": None, "url": None}
+    cols = list(df.columns)
+    out = {
+        "name": base.get("name"),
+        "price": base.get("price"),
+        "id": base.get("id"),
+        "img": base.get("img"),
+        "url": base.get("url"),
+    }
+    if not out["name"]:
+        text_candidates = []
+        for c in cols:
+            s = df[c]
+            if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+                nn = s.fillna("").astype(str).str.strip()
+                score = int((nn != "").sum())
+                if score > 0:
+                    text_candidates.append((score, c))
+        if text_candidates:
+            text_candidates.sort(reverse=True)
+            out["name"] = text_candidates[0][1]
+    if not out["price"]:
+        num_candidates = []
+        for c in cols:
+            s = pd.to_numeric(df[c], errors="coerce")
+            score = int(s.notna().sum())
+            if score > 0:
+                num_candidates.append((score, c))
+        if num_candidates:
+            num_candidates.sort(reverse=True)
+            out["price"] = num_candidates[0][1]
+    if not out["id"]:
+        for c in cols:
+            lc = str(c).strip().lower()
+            if any(k in lc for k in ("id", "sku", "معرف", "رقم", "barcode", "باركود")):
+                out["id"] = c
+                break
+        if not out["id"] and out["name"] and out["name"] in cols:
+            out["id"] = out["name"]
+    return out
+
+
 def _dashboard_competitor_label(upload_name: str) -> str:
     """اسم عرض للمنافس من اسم الملف (بدون .csv)."""
     n = (upload_name or "").strip()
@@ -636,7 +689,22 @@ def _render_reconciliation_dashboard(audit_stats: dict):
 
     if not rec.get("balance_ok", True) and rec.get("warning_message"):
         st.warning(rec["warning_message"])
+    _diag = rec.get("diagnostics") or {}
+    _dup = int(_diag.get("duplicate_skipped") or 0)
+    _excluded_total = int(w + _dup)
     _fb = st.session_state.get("reconciliation_failed_csv")
+    if _excluded_total > 0:
+        ex1, ex2 = st.columns([2, 1])
+        ex1.metric("🚨 المنتجات المكررة/المستبعدة", f"{_excluded_total:,} منتج")
+        with ex2:
+            if _fb:
+                st.download_button(
+                    label="⬇️ تنزيل المستبعدات الآن",
+                    data=_fb,
+                    file_name="failed_rows.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_failed_rows_prominent",
+                )
     if not _fb:
         from pathlib import Path
 
@@ -870,6 +938,29 @@ def _processed_row_url_chips_html(our_url: str, comp_url: str) -> str:
     return '<span style="margin-right:8px">&nbsp;|&nbsp;</span>' + '<span style="margin:0 4px;color:#555">·</span>'.join(parts)
 
 
+def _track_processed_price_sku(product_id) -> None:
+    # FIX: Smart Workflow & AI Tracking
+    _pid = str(product_id or "").strip()
+    if _pid and _pid not in ("nan", "None", "NaN"):
+        st.session_state["processed_price_skus"].add(_pid)
+
+
+def _track_processed_missing_url(comp_url: str) -> None:
+    # FIX: Smart Workflow & AI Tracking
+    _url = str(comp_url or "").strip()
+    if _url:
+        st.session_state["processed_missing_urls"].add(_url)
+
+
+def _show_transparency_counter(total_count: int, visible_count: int, label: str = "منتجاً") -> None:
+    # FIX: Transparency & Reversibility
+    hidden_count = max(0, int(total_count or 0) - int(visible_count or 0))
+    st.info(
+        f"يوجد {int(total_count or 0)} {label} في هذه الفئة. "
+        f"(تم إخفاء {hidden_count} {label} لأنها في قائمة 'تمت المعالجة' أو مخفية يدوياً)."
+    )
+
+
 # ════════════════════════════════════════════════
 #  Callbacks — أحداث الأزرار التفاعلية (Event-Driven)
 #  تُعرَّف هنا (خارج حلقة الرسم) حتى تتوافق مع on_click.
@@ -894,18 +985,25 @@ def _cb_send_make(
         )
         return
 
-    _ok = trigger_price_update(
-        pid, _tp, comp_url,
-        name=our_name,
-        comp_name=comp_name,
-        comp_price=comp_price,
-        diff=diff,
-        decision=decision,
-        competitor=comp_src,
-    )
+    # FIX: Transparency & Reversibility
+    _mk_res = send_single_product({
+        "product_id": pid,
+        "name": our_name,
+        "price": float(_tp),
+        "comp_name": comp_name,
+        "comp_price": comp_price,
+        "diff": diff,
+        "decision": decision,
+        "competitor": comp_src,
+        "comp_url": comp_url or "",
+    })
+    _mk_status = int(_mk_res.get("status_code") or 0)
+    _ok = bool(_mk_res.get("success")) and _mk_status in (200, 201, 202, 204)
 
     _hk = f"{prefix}_{our_name}_{idx}"
     if _ok:
+        _track_processed_price_sku(pid)  # FIX: Smart Workflow & AI Tracking
+        _track_processed_missing_url(comp_url)  # FIX: Smart Workflow & AI Tracking
         st.session_state.hidden_products.add(_hk)
         try:
             save_hidden_product(_hk, our_name, "sent_to_make")
@@ -920,10 +1018,12 @@ def _cb_send_make(
         st.session_state["_action_toast"] = (
             "success", f"✅ تم إرسال «{our_name}» ← {_tp:,.0f} ر.س"
         )
+        st.rerun()  # FIX: Smart Workflow & AI Tracking
     else:
         st.session_state[f"_act_{prefix}_{idx}"] = (
-            "error", "❌ فشل الإرسال — تحقق من الـ Webhook أو البيانات."
+            "error", f"❌ فشل الإرسال إلى Make ({_mk_status or 'NO_HTTP'}) — لم يتم تعليم المنتج كمعالج."
         )
+        st.error(f"❌ فشل الإرسال إلى Make: {_mk_res.get('message', 'خطأ غير معروف')}")  # FIX: Transparency & Reversibility
 
 
 def _cb_exclude(
@@ -1063,7 +1163,17 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                 res = send_new_products(products)
             else:
                 res = send_price_updates(products)
-            if res["success"]:
+            _mk_status = int(res.get("status_code") or 0)  # FIX: Transparency & Reversibility
+            _mk_ok = bool(res.get("success")) and _mk_status in (200, 201, 202, 204)  # FIX: Transparency & Reversibility
+            if _mk_ok:
+                if section_type in ("missing", "new"):  # FIX: Smart Workflow & AI Tracking
+                    if "رابط_المنافس" in filtered.columns:
+                        for _u in filtered["رابط_المنافس"].dropna().astype(str):
+                            _track_processed_missing_url(_u)
+                else:
+                    if "معرف_المنتج" in filtered.columns:
+                        for _pid in filtered["معرف_المنتج"].dropna().astype(str):
+                            _track_processed_price_sku(_pid)
                 st.success(res["message"])
                 # v26: سجّل كل منتج في processed_products
                 for _i, (_idx, _r) in enumerate(filtered.iterrows()):
@@ -1081,7 +1191,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                                    notes=f"إرسال جماعي ← {prefix}")
                 st.rerun()
             else:
-                st.error(res["message"])
+                st.error(f"❌ فشل الإرسال إلى Make: {res.get('message', 'خطأ غير معروف')}")  # FIX: Transparency & Reversibility
     with ac5:
         # جمع القرارات المعلقة وإرسالها
         pending = {k: v for k, v in st.session_state.decisions_pending.items()
@@ -1102,6 +1212,17 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
             st.session_state.decisions_pending = {}
             st.rerun()
 
+    # FIX: Transparency & Reversibility
+    _hidden_in_view = 0
+    for _idx, _row in filtered.iterrows():
+        _our_name_h = str(_row.get("المنتج", "—"))
+        _hide_key_h = f"{prefix}_{_our_name_h}_{_idx}"
+        if _hide_key_h in st.session_state.hidden_products:
+            _hidden_in_view += 1
+            continue
+        if prefix in ("raise", "lower") and st.session_state.get(f"excluded_{prefix}_{_idx}"):
+            _hidden_in_view += 1
+    _show_transparency_counter(len(df), max(0, len(filtered) - _hidden_in_view))
     st.caption(f"عرض {len(filtered)} من {len(df)} منتج — {datetime.now().strftime('%H:%M:%S')}")
 
     # ── Pagination ─────────────────────────────
@@ -1466,6 +1587,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                     })
                     if res["success"]:
                         _hk = f"{prefix}_{our_name}_{idx}"
+                        _track_processed_price_sku(_pid)  # FIX: Smart Workflow & AI Tracking
                         st.session_state.hidden_products.add(_hk)
                         save_hidden_product(_hk, our_name, "sent_to_make")
                         # ── توجيه آلي → تمت المعالجة ──
@@ -1889,6 +2011,18 @@ if page == "📊 لوحة التحكم":
                     if _key in r and not r[_key].empty:
                         _p = export_to_make_format(r[_key], _sec)
                         _res = send_batch_smart(_p, batch_type=_btype, batch_size=20, max_retries=3)
+                        _full_success = (_res.get("sent", 0) == len(_p)) and (_res.get("failed", 0) == 0)  # FIX: Transparency & Reversibility
+                        if _full_success:
+                            if _key == "missing":
+                                if "رابط_المنافس" in r[_key].columns:
+                                    for _u in r[_key]["رابط_المنافس"].dropna().astype(str):
+                                        _track_processed_missing_url(_u)
+                            else:
+                                if "معرف_المنتج" in r[_key].columns:
+                                    for _pid in r[_key]["معرف_المنتج"].dropna().astype(str):
+                                        _track_processed_price_sku(_pid)
+                        elif _res.get("failed", 0) > 0:
+                            st.error(f"❌ {_label}: فشل جزئي/كامل، لم يتم وسم المنتجات كـ(تمت المعالجة).")  # FIX: Transparency & Reversibility
                         _sent_total += _res.get("sent", 0)
                         _fail_total += _res.get("failed", 0)
                         _status_all.caption(f"{_label}: ✅ {_res.get('sent',0)} | ❌ {_res.get('failed',0)}")
@@ -2041,12 +2175,8 @@ if page == "📊 لوحة التحكم":
 
     _copt3a, _copt3b = st.columns(2)
     with _copt3a:
-        st.checkbox(
-            "📎 دمج نتائج التحليل مع النتائج الحالية في الجلسة (تراكمي)",
-            value=True,
-            key="dash_accumulate_results",
-            help="يُبقي صفوف التحليل السابقة؛ عند تكرار نفس المنتج/المنافس يُعتمد آخر تشغيل.",
-        )
+        # FIX: Relaxed Constraints — منع فقدان النتائج السابقة بإجبار الدمج التراكمي دائماً.
+        st.caption("📎 الدمج التراكمي للنتائج: **مفعّل دائماً (Zero Data Loss)**")
     with _copt3b:
         st.checkbox(
             "📚 تحديث كتالوج قاعدة البيانات من الملفات المرفوعة",
@@ -2056,6 +2186,8 @@ if page == "📊 لوحة التحكم":
         )
 
     if st.button("🚀 بدء التحليل", type="primary", key="dash_btn_start_analysis"):
+        st.session_state["processed_price_skus"].clear()  # FIX: Smart Workflow & AI Tracking
+        st.session_state["processed_missing_urls"].clear()  # FIX: Smart Workflow & AI Tracking
         # ── حارس المدخلات (يدعم الوضعين: يدوي وتلقائي) ──────────────────
         _auto_mode = bool(st.session_state.get("dash_use_auto_scraper")) and _auto_available
         if not our_file:
@@ -2162,7 +2294,7 @@ if page == "📊 لوحة التحكم":
                     if not comp_dfs:
                         st.error("❌ لم يُحمّل أي ملف منافس صالح")
                     else:
-                        _catc = resolve_catalog_columns(our_df)
+                        _catc = _resolve_catalog_columns_relaxed(our_df)
                         if _dash_upd_db_cat:
                             r_our = upsert_our_catalog(
                                 our_df,
@@ -2349,6 +2481,11 @@ elif page == "🔴 سعر أعلى":
     db_log("price_raise", "view")
     if st.session_state.results and "price_raise" in st.session_state.results:
         df = st.session_state.results["price_raise"]
+        _price_raise_total = len(df) if isinstance(df, pd.DataFrame) else 0  # FIX: Transparency & Reversibility
+        if isinstance(df, pd.DataFrame) and not df.empty and "معرف_المنتج" in df.columns:
+            _proc_price = {str(x) for x in st.session_state.get("processed_price_skus", set())}
+            df = df[~df["معرف_المنتج"].astype(str).isin(_proc_price)]  # FIX: Smart Workflow & AI Tracking
+        _show_transparency_counter(_price_raise_total, len(df) if isinstance(df, pd.DataFrame) else 0)  # FIX: Transparency & Reversibility
         if not df.empty:
             st.markdown(
                 f'<p style="margin:4px 0 8px;font-size:1.05rem;font-weight:700;color:#FF5252">'
@@ -2387,6 +2524,11 @@ elif page == "🟢 سعر أقل":
     db_log("price_lower", "view")
     if st.session_state.results and "price_lower" in st.session_state.results:
         df = st.session_state.results["price_lower"]
+        _price_lower_total = len(df) if isinstance(df, pd.DataFrame) else 0  # FIX: Transparency & Reversibility
+        if isinstance(df, pd.DataFrame) and not df.empty and "معرف_المنتج" in df.columns:
+            _proc_price = {str(x) for x in st.session_state.get("processed_price_skus", set())}
+            df = df[~df["معرف_المنتج"].astype(str).isin(_proc_price)]  # FIX: Smart Workflow & AI Tracking
+        _show_transparency_counter(_price_lower_total, len(df) if isinstance(df, pd.DataFrame) else 0)  # FIX: Transparency & Reversibility
         if not df.empty:
             st.info(f"💰 {len(df)} منتج يمكن رفع سعره لزيادة الهامش")
             with st.expander("🤖 نصيحة AI لهذا القسم", expanded=False):
@@ -2468,7 +2610,42 @@ elif page == "🔍 منتجات مفقودة":
     db_log("missing", "view")
 
     if st.session_state.results and "missing" in st.session_state.results:
-        df = st.session_state.results["missing"]
+        df_missing = st.session_state.results["missing"]
+        df_missing_to_show = df_missing.copy() if isinstance(df_missing, pd.DataFrame) else pd.DataFrame()
+        _missing_total = len(df_missing) if isinstance(df_missing, pd.DataFrame) else 0  # FIX: Missing Products Display Recovery
+        # FIX: Safe Filtering for Missing Products to prevent KeyError
+        if isinstance(df_missing, pd.DataFrame):
+            if not df_missing.empty:
+                link_col_actual = None
+                possible_link_cols = ["رابط_المنافس", "الرابط", "رابط المنتج", "url", "رابط", "Link"]
+                for col in possible_link_cols:
+                    if col in df_missing.columns:
+                        link_col_actual = col
+                        break
+                if link_col_actual:
+                    df_missing_to_show = df_missing[
+                        ~df_missing[link_col_actual].astype(str).isin(
+                            {str(x) for x in st.session_state.get("processed_missing_urls", set())}
+                        )
+                    ]
+                else:
+                    name_col_actual = "المنتج"
+                    for ncol in ["المنتج", "اسم المنتج", "منتج_المنافس", "Name"]:
+                        if ncol in df_missing.columns:
+                            name_col_actual = ncol
+                            break
+                    if name_col_actual in df_missing.columns:
+                        df_missing_to_show = df_missing[
+                            ~df_missing[name_col_actual].astype(str).isin(
+                                {str(x) for x in st.session_state.get("processed_missing_urls", set())}
+                            )
+                        ]
+                    else:
+                        df_missing_to_show = df_missing.copy()
+            else:
+                df_missing_to_show = df_missing.copy()
+        df = df_missing_to_show
+        _show_transparency_counter(_missing_total, len(df_missing_to_show) if isinstance(df_missing_to_show, pd.DataFrame) else 0)  # FIX: Missing Products Display Recovery
         if df is not None and not df.empty:
             # ── إحصاءات سريعة ──────────────────────────────────────────────
             total_miss   = len(df)
@@ -2759,6 +2936,20 @@ elif page == "🔍 منتجات مفقودة":
                 if st.session_state.get("ready_missing_df") is not None and not st.session_state.ready_missing_df.empty:
                     _ready_df = st.session_state.ready_missing_df
                     _our_df_ref = st.session_state.get("our_df")
+                    salla_export_mode = st.radio(
+                        "⚙️ وضع تصدير ملف سلة (للمفقودات):",  # FIX: Salla Export Mode Toggle
+                        options=[
+                            "Strict Safe Mode (ينصح به لتجنب الأخطاء)",
+                            "Category Path Mode (استخدام المسار الكامل للتصنيف)",
+                        ],
+                        index=0 if st.session_state.get("salla_export_mode", "safe") == "safe" else 1,
+                        help="الوضع الآمن يرسل اسم التصنيف النهائي فقط. وضع المسار يرسل المسار الكامل (مثل: العطور > عطور رجالية) ويجب أن يكون متطابقاً 100% في متجرك.",
+                        key="missing_salla_export_mode_ui",
+                    )
+                    st.session_state["salla_export_mode"] = (  # FIX: Salla Export Mode Toggle
+                        "safe" if "Strict" in salla_export_mode else "path"
+                    )
+                    _export_mode = st.session_state.get("salla_export_mode", "safe")
 
                     # ── التحقق من المنتجات المفقودة فعلاً ─────────────────
                     try:
@@ -2785,7 +2976,7 @@ elif page == "🔍 منتجات مفقودة":
                     # ── زر CSV (مطابق لقالب سلة الرسمي) ─────────────────
                     try:
                         _csv_bytes, _csv_count, _ = export_to_salla_shamel_csv(
-                            export_df, _our_df_ref, verify_missing=False
+                            export_df, _our_df_ref, verify_missing=False, export_mode=_export_mode  # FIX: Salla Export Mode Toggle
                         )
                         st.download_button(
                             "📥 2. تحميل ملف سلة CSV (مطابق للقالب الرسمي)",
@@ -2802,7 +2993,7 @@ elif page == "🔍 منتجات مفقودة":
                     # ── زر XLSX (احتياطي) ────────────────────────────────
                     try:
                         _xlsx_bytes = export_to_salla_shamel(
-                            export_df, _our_df_ref, verify_missing=False
+                            export_df, _our_df_ref, verify_missing=False, export_mode=_export_mode  # FIX: Salla Export Mode Toggle
                         )
                         st.download_button(
                             "📥 تحميل ملف سلة XLSX (Excel)",
@@ -2862,8 +3053,18 @@ elif page == "🔍 منتجات مفقودة":
                         confidence_filter=_conf_val,
                     )
                     _prog_bar.progress(1.0, text="اكتمل")
-                    if res["success"]:
+                    _full_success = (res.get("sent", 0) == len(products)) and (res.get("failed", 0) == 0)  # FIX: Transparency & Reversibility
+                    if _full_success:
                         st.success(res["message"])
+                        # FIX: Missing Products Display Recovery
+                        _miss_link_col = None
+                        for _c in ["رابط_المنافس", "الرابط", "رابط المنتج", "url", "رابط", "Link"]:
+                            if _c in _to_send.columns:
+                                _miss_link_col = _c
+                                break
+                        if _miss_link_col:
+                            for _u in _to_send[_miss_link_col].dropna().astype(str):
+                                _track_processed_missing_url(_u)
                         # v26: احفظ في قائمة المعالجة
                         for _, _pr in _to_send.iterrows():
                             _pk = f"miss_{str(_pr.get('منتج_المنافس',''))[:30]}_{str(_pr.get('المنافس',''))}"
@@ -2874,8 +3075,10 @@ elif page == "🔍 منتجات مفقودة":
                                 "send_missing",
                                 new_price=safe_float(_pr.get('سعر_المنافس',0)),
                             )
+                        st.rerun()  # FIX: Smart Workflow & AI Tracking
                     else:
-                        st.error(res["message"])
+                        st.error(f"❌ فشل الإرسال الكامل إلى Make: {res.get('message', 'خطأ غير معروف')}")  # FIX: Transparency & Reversibility
+                        st.error("لم يتم تعليم أي منتج كمُعالج لأن الإرسال لم ينجح بالكامل.")  # FIX: Transparency & Reversibility
                     if res.get("errors"):
                         with st.expander(f"❌ منتجات فشلت ({len(res['errors'])})"):
                             for _en in res["errors"]:
@@ -3280,10 +3483,90 @@ elif page == "⚠️ تحت المراجعة":
 # ════════════════════════════════════════════════
 #  تمت المعالجة — v26
 # ════════════════════════════════════════════════
-elif page == "✔️ تمت المعالجة":
+elif page in ("✔️ تمت المعالجة", "✅ تمت المعالجة"):
     st.header("✔️ المنتجات المعالجة")
     st.caption("جميع المنتجات التي تم ترحيلها أو تحديث سعرها أو إضافتها")
     db_log("processed", "view")
+
+    _analysis_df = st.session_state.get("analysis_df", pd.DataFrame())
+    _missing_df = (st.session_state.get("results") or {}).get("missing", pd.DataFrame())
+    _proc_ids = {str(x) for x in st.session_state.get("processed_price_skus", set())}
+    _proc_urls = {str(x) for x in st.session_state.get("processed_missing_urls", set())}
+
+    _processed_price_df = pd.DataFrame()
+    if isinstance(_analysis_df, pd.DataFrame) and not _analysis_df.empty and "معرف_المنتج" in _analysis_df.columns:
+        _processed_price_df = _analysis_df[_analysis_df["معرف_المنتج"].astype(str).isin(_proc_ids)].copy()
+
+    _processed_missing_df = pd.DataFrame()
+    if isinstance(_missing_df, pd.DataFrame) and not _missing_df.empty and "رابط_المنافس" in _missing_df.columns:
+        _processed_missing_df = _missing_df[_missing_df["رابط_المنافس"].astype(str).isin(_proc_urls)].copy()
+
+    proc_t1, proc_t2, proc_t3 = st.tabs(["💰 أسعار تم تعديلها", "📦 مفقودات تمت إضافتها", "🤖 ملخص ذكي"])  # FIX: Smart Workflow & AI Tracking
+    with proc_t1:
+        if _processed_price_df.empty:
+            st.info("لا توجد عناصر سعرية معالجة في هذه الجلسة.")
+        else:
+            st.dataframe(_processed_price_df, use_container_width=True, height=260)
+            # FIX: Transparency & Reversibility
+            _price_revert_ids = sorted({
+                str(x) for x in _processed_price_df.get("معرف_المنتج", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                if str(x).strip() not in ("", "nan", "None", "NaN")
+            })
+            _sel_price_revert = st.multiselect(
+                "اختر معرفات المنتجات لإلغاء المعالجة",
+                _price_revert_ids,
+                key="processed_price_revert_ids",
+            )
+            if st.button("↩️ إلغاء المعالجة للأسعار المحددة", key="processed_price_revert_btn", disabled=not _sel_price_revert):
+                for _pid in _sel_price_revert:
+                    st.session_state["processed_price_skus"].discard(str(_pid))
+                st.success(f"تمت إعادة {len(_sel_price_revert)} منتج إلى الأقسام الأصلية.")
+                st.rerun()
+    with proc_t2:
+        if _processed_missing_df.empty:
+            st.info("لا توجد منتجات مفقودة معالجة في هذه الجلسة.")
+        else:
+            st.dataframe(_processed_missing_df, use_container_width=True, height=260)
+            # FIX: Transparency & Reversibility
+            _miss_revert_urls = sorted({
+                str(x) for x in _processed_missing_df.get("رابط_المنافس", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                if str(x).strip()
+            })
+            _sel_miss_revert = st.multiselect(
+                "اختر روابط المفقودات لإلغاء المعالجة",
+                _miss_revert_urls,
+                key="processed_missing_revert_urls",
+            )
+            if st.button("↩️ إلغاء معالجة المفقودات المحددة", key="processed_missing_revert_btn", disabled=not _sel_miss_revert):
+                for _u in _sel_miss_revert:
+                    st.session_state["processed_missing_urls"].discard(str(_u))
+                st.success(f"تمت إعادة {len(_sel_miss_revert)} مفقود إلى قائمته الأصلية.")
+                st.rerun()
+    with proc_t3:
+        if st.button("🤖 توليد تقرير ذكي للإجراءات (AI Summary)", key="processed_ai_summary_btn"):  # FIX: Smart Workflow & AI Tracking
+            _price_lines = []
+            if not _processed_price_df.empty:
+                for _, _r in _processed_price_df.head(120).iterrows():
+                    _price_lines.append(
+                        f"- المنتج: {str(_r.get('المنتج',''))} | قديم: {safe_float(_r.get('السعر',0)):.2f} | جديد: {safe_float(_r.get('سعر_المنافس',0)):.2f}"
+                    )
+            _missing_lines = []
+            if not _processed_missing_df.empty:
+                for _, _r in _processed_missing_df.head(120).iterrows():
+                    _missing_lines.append(
+                        f"- منتج مفقود مضاف: {str(_r.get('منتج_المنافس',''))} | سعر مرجعي: {safe_float(_r.get('سعر_المنافس',0)):.2f}"
+                    )
+            _actions_text = (
+                "## Price Actions\n"
+                + ("\n".join(_price_lines) if _price_lines else "- لا توجد تعديلات أسعار مسجلة في هذه الجلسة")
+                + "\n\n## Missing Products Added\n"
+                + ("\n".join(_missing_lines) if _missing_lines else "- لا توجد منتجات مفقودة مضافة في هذه الجلسة")
+            )
+            _ai_sum = generate_action_summary(_actions_text)
+            if _ai_sum.get("success"):
+                st.success(_ai_sum.get("response", ""))
+            else:
+                st.info(_ai_sum.get("response", "تعذر توليد الملخص حالياً."))
 
     processed = get_processed(limit=500)
     if not processed:
@@ -3430,6 +3713,16 @@ elif page == "⚡ أتمتة Make":
                         res = send_missing_products(_sendable)
                     else:
                         res = send_price_updates(_sendable)
+                    # FIX: Missing Products Display Recovery
+                    if sec_type == "missing" and res.get("success"):
+                        _missing_link_col = None
+                        for _c in ["رابط_المنافس", "الرابط", "رابط المنتج", "url", "رابط", "Link"]:
+                            if _c in df_s.columns:
+                                _missing_link_col = _c
+                                break
+                        if _missing_link_col:
+                            for _u in df_s[_missing_link_col].dropna().astype(str):
+                                _track_processed_missing_url(_u)
                     st.success(res["message"]) if res["success"] else st.error(res["message"])
             else:
                 st.info("لا توجد بيانات في هذا القسم")
@@ -4386,7 +4679,21 @@ elif page == "🕷️ كشط المنافسين":
         with st.expander("🚀 أدوات الكشط المتقدمة", expanded=False):
             if hasattr(_scraper_advanced_runtime_mod, "show"):
                 try:
-                    _scraper_advanced_runtime_mod.show(embedded=True)
+                    _show_fn = getattr(_scraper_advanced_runtime_mod, "show", None)
+                    if callable(_show_fn):
+                        _supports_embedded = False
+                        try:
+                            import inspect as _inspect
+                            _supports_embedded = "embedded" in _inspect.signature(_show_fn).parameters
+                        except Exception:
+                            _supports_embedded = False
+
+                        if _supports_embedded:
+                            _show_fn(embedded=True)
+                        else:
+                            _show_fn()
+                    else:
+                        st.error("⚠️ show ليس دالة قابلة للتنفيذ في pages/scraper_advanced.py")
                 except Exception as _sa_render_err:
                     st.error(f"❌ خطأ في الأدوات المتقدمة: {_sa_render_err}")
             else:
