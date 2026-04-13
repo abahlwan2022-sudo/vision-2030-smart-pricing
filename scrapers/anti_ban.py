@@ -269,6 +269,43 @@ def _get_req_session():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  3b. ZenRows — وكيل جلب (Cloudflare / سلة) عند ZENROWS_API_KEY
+# ══════════════════════════════════════════════════════════════════════════
+def _zenrows_key_mode() -> tuple[Optional[str], str]:
+    try:
+        from config import ZENROWS_API_KEY, ZENROWS_MODE
+
+        k = (ZENROWS_API_KEY or "").strip()
+        m = (ZENROWS_MODE or "auto").strip() or "auto"
+        return (k if k else None, m)
+    except ImportError:
+        import os
+
+        k = os.environ.get("ZENROWS_API_KEY", "").strip()
+        m = (os.environ.get("ZENROWS_MODE", "auto") or "auto").strip()
+        return (k if k else None, m)
+
+
+def try_zenrows(url: str, timeout: int = 45) -> Optional[str]:
+    key, mode = _zenrows_key_mode()
+    if not key:
+        return None
+    try:
+        import requests
+
+        resp = requests.get(
+            "https://api.zenrows.com/v1/",
+            params={"url": url, "apikey": key, "mode": mode},
+            timeout=max(timeout, 15),
+        )
+        if resp.status_code == 200 and (resp.text or "").strip():
+            return resp.text
+    except Exception as exc:
+        logger.debug("zenrows %s: %s", url, type(exc).__name__)
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  4. curl_cffi — TLS Fingerprint حقيقي 
 # ══════════════════════════════════════════════════════════════════════════
 def try_curl_cffi(url: str, timeout: int = 25) -> Optional[str]:
@@ -305,10 +342,15 @@ def try_cloudscraper(url: str, timeout: int = 25) -> Optional[str]:
 # ══════════════════════════════════════════════════════════════════════════
 def try_all_sync_fallbacks(url: str, timeout: int = 25) -> Optional[str]:
     """
-    يحاول curl_cffi أولاً، ثم cloudscraper، ثم requests.
+    يحاول ZenRows (إن وُجد مفتاح)، ثم curl_cffi، ثم cloudscraper، ثم requests.
     ✅ يستقبل timeout لمنع الـ Threads من التعلق إلى الأبد.
     """
-    # المحاولة 1: curl_cffi مع انتحال شخصية Chrome (الأقوى حالياً)
+    # المحاولة 0: ZenRows — متاجر محمية (مثل سلة + Cloudflare)
+    z_html = try_zenrows(url, timeout=timeout)
+    if z_html and not looks_like_bot_challenge(z_html):
+        return z_html
+
+    # المحاولة 1: curl_cffi مع انتحال شخصية Chrome (الأقوى محلياً)
     html = try_curl_cffi(url, timeout=timeout)
     if html and not looks_like_bot_challenge(html):
         return html
