@@ -1,0 +1,18 @@
+.git
+.gitignore
+.cursor
+**/__pycache__
+**/*.pyc
+**/*.pyo
+*.db
+.env
+.venv
+venv
+.streamlit/secrets.toml
+.dockerignore
+terminals
+agent-transcripts
+mcps
+
+# ملفات البيانات المحلية — تُحقن عبر env vars أو Railway Volume
+data/

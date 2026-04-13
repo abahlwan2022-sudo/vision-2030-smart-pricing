@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+
+# Data & Logs
+data/*
+!data/.gitkeep
+*.log
+scraper_progress.json
+scheduler_state.json
+scraper.pid
+
+# OS
+.DS_Store
+Thumbs.db

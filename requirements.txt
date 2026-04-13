@@ -1,0 +1,15 @@
+streamlit==1.55.0
+pandas==2.3.3
+# مطلوب لـ utils/salla_shamel_export.py و engines/reconciliation_engine.py (تصدير .xlsx)
+openpyxl==3.1.5
+# مطلوب لـ engines/reconciliation_engine.py (fuzzy matching)
+rapidfuzz==3.14.3
+requests==2.33.0
+plotly==6.6.0
+streamlit-autorefresh>=1.0.1
+aiohttp==3.13.3
+cloudscraper>=1.2.71
+beautifulsoup4>=4.12.0
+curl_cffi>=0.7.0
+# مطلوب لـ engines/reconciliation_engine.py (matrix operations)
+numpy>=1.26.0
