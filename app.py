@@ -2066,6 +2066,11 @@ if page == "📊 لوحة التحكم":
     _auto_available = _os_dash.path.exists(_AUTO_CSV)
     _auto_rows = 0   # ← يُهيَّأ دائماً لمنع NameError إذا تغيّرت حالة الملف بين reruns
 
+    # تشغيل تلقائي لوضع البيانات الآلية بمجرد توفر ملف الناتج
+    # (المستخدم يقدر يلغيه يدوياً إذا أراد).
+    if _auto_available and "dash_use_auto_scraper" not in st.session_state:
+        st.session_state["dash_use_auto_scraper"] = True
+
     if _auto_available:
         _auto_rows = 0
         try:
@@ -2093,7 +2098,10 @@ if page == "📊 لوحة التحكم":
 
     _use_auto = st.checkbox(
         "🤖 استخدام بيانات الكشط التلقائي من المنافسين",
-        value=bool(st.session_state.pop("_use_auto_scraper", False)) and _auto_available,
+        value=(
+            bool(st.session_state.pop("_use_auto_scraper", False))
+            or bool(st.session_state.get("dash_use_auto_scraper", False))
+        ) and _auto_available,
         disabled=not _auto_available,
         key="dash_use_auto_scraper",
         help="يستخدم الملف المُنتج تلقائياً من محرك الكشط بدلاً من رفع ملف يدوياً",
