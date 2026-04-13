@@ -151,6 +151,8 @@ def _get_scraper_advanced_module():
         return None
 
 
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def _cached_thumb_from_product_url(page_url: str) -> str:
     """صورة معاينة من صفحة المنتج عندما لا يوجد عمود صورة في الجدول المحفوظ."""
