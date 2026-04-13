@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import logging
 import urllib.parse
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, FeatureNotFound
 from typing import List, Set
 from scrapers.anti_ban import stealth_manager
 
@@ -51,7 +51,17 @@ class SitemapResolver:
             await stealth_manager.apply_smart_delay(1.5, 4.0)
 
             async with session.get(sitemap_url, headers=headers, timeout=20) as response:
-                html_content = await response.text()
+                # ── حارس 403 / 401: حظر صريح من الخادم ────────────────────
+                if response.status in (401, 403):
+                    logger.warning(
+                        "[Sitemap] HTTP %s (ban/forbidden) on %s — skipping gracefully",
+                        response.status, sitemap_url,
+                    )
+                    return []
+
+                # ── قراءة المحتوى مرة واحدة فقط (aiohttp يسمح بقراءة واحدة) ──
+                html_content = await response.text(errors="ignore")
+
                 is_banned, ban_msg = stealth_manager.is_shadow_banned(html_content, response.status)
 
                 if is_banned:
@@ -60,8 +70,16 @@ class SitemapResolver:
                     await stealth_manager.dynamic_backoff(attempt_number=2)
                     return []
 
-                content = await response.read()
-                soup = BeautifulSoup(content, 'xml')
+                # ── تحليل XML مع Fallback آمن للـ parser ──────────────────
+                try:
+                    soup = BeautifulSoup(html_content, 'xml')
+                except FeatureNotFound:
+                    # lxml غير مثبت في البيئة الحالية → html.parser كبديل آمن
+                    logger.warning(
+                        "[Sitemap] lxml XML parser unavailable, falling back to html.parser"
+                    )
+                    soup = BeautifulSoup(html_content, 'html.parser')
+
                 loc_tags = soup.find_all('loc')
 
                 tasks = []
