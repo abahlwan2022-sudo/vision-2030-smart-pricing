@@ -414,11 +414,9 @@ def _render_full_auto_daemon_ui() -> None:
     k3.metric("Products", f"{int(state.get('products_done', 0))}/{int(state.get('products_total', 0))}")
     k4.metric("Success / Errors", f"{int(state.get('success_count', 0))} / {int(state.get('error_count', 0))}")
 
-    st.info(
-        f"Current: {state.get('current_store') or '—'} | "
-        f"Message: {state.get('message') or '—'} | "
-        f"Last update: {state.get('updated_at') or '—'}"
-    )
+    # سطر واحد بدون تكرار اسم المتجر (كان يظهر في current_store وفي message معًا)
+    st.info(state.get("message") or "—")
+    st.caption(f"آخر تحديث: {state.get('updated_at') or '—'}")
 
     if state.get("last_error"):
         st.error(f"Last error: {state.get('last_error')}")
