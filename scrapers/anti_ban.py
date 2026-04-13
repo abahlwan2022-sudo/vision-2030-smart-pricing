@@ -18,7 +18,6 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import aiohttp
-import os
 
 # تجاهل تحذيرات SSL المزعجة في الـ Terminal لتنظيف الـ Logs
 import urllib3
@@ -188,19 +187,11 @@ async def fetch_with_retry(
     domain = urlparse(url).netloc
     rl = get_rate_limiter()
 
-    proxy = get_proxy()
     for attempt in range(max_retries):
         headers = get_browser_headers(referer=referer or f"https://{domain}/")
         try:
             await rl.wait(domain)
-            # تمرير البروكسي لـ aiohttp إذا وجد
-            resp = await session.get(
-                url, 
-                headers=headers, 
-                ssl=False, 
-                allow_redirects=True,
-                proxy=proxy
-            )
+            resp = await session.get(url, headers=headers, ssl=False, allow_redirects=True)
 
             if resp.status == 200:
                 rl.record_success(domain)
@@ -240,11 +231,6 @@ _SESSION_LOCK = threading.Lock()
 _CFFI_SESSION = None
 _CLOUD_SCRAPER = None
 _REQ_SESSION = None
-
-def get_proxy() -> Optional[str]:
-    """يجلب البروكسي من متغيرات البيئة (SCRAPER_PROXY أو HTTP_PROXY)."""
-    proxy = os.environ.get("SCRAPER_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-    return proxy.strip() if proxy else None
 
 def _get_cffi_session():
     global _CFFI_SESSION
@@ -289,16 +275,10 @@ def try_curl_cffi(url: str, timeout: int = 25) -> Optional[str]:
     session = _get_cffi_session()
     if session is None:
         return None
-    proxy = get_proxy()
     try:
-        resp = session.get(
-            url, 
-            timeout=timeout, 
-            allow_redirects=True,
-            proxy=proxy
-        )
-        return resp.text
-    except Exception as exc:n resp.text
+        resp = session.get(url, timeout=timeout, allow_redirects=True)
+        if resp.status_code == 200:
+            return resp.text
     except Exception as exc:
         logger.debug("curl_cffi %s: %s", url, type(exc).__name__)
     return None
@@ -311,10 +291,8 @@ def try_cloudscraper(url: str, timeout: int = 25) -> Optional[str]:
     scraper = _get_cloudscraper()
     if scraper is None:
         return None
-    proxy = get_proxy()
-    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        resp = scraper.get(url, timeout=timeout, proxies=proxies)
+        resp = scraper.get(url, timeout=timeout)
         if resp.status_code == 200:
             return resp.text
     except Exception as exc:
@@ -344,16 +322,7 @@ def try_all_sync_fallbacks(url: str, timeout: int = 25) -> Optional[str]:
     try:
         headers = get_browser_headers(referer=f"https://{urlparse(url).netloc}/")
         session = _get_req_session()
-        proxy = get_proxy()
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        resp = session.get(
-            url, 
-            headers=headers, 
-            timeout=timeout, 
-            allow_redirects=True, 
-            verify=False,
-            proxies=proxies
-        )
+        resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True, verify=False)
         
         if resp.status_code == 200:
             if not looks_like_bot_challenge(resp.text):
@@ -374,3 +343,44 @@ def looks_like_bot_challenge(html: str) -> bool:
     ]
     head = html[:15000].lower()
     return any(s in head for s in snippets)
+
+
+class _StealthManagerCompat:
+    """
+    واجهة توافقية لملفات المشروع التي ما زالت تعتمد stealth_manager.
+    """
+
+    def get_secure_headers(self, referer: str = "") -> dict:
+        return get_browser_headers(referer=referer)
+
+    async def apply_smart_delay(self, min_delay: float = 0.5, max_delay: float = 1.5) -> None:
+        await asyncio.sleep(random.uniform(max(0.0, min_delay), max(min_delay, max_delay)))
+
+    def is_shadow_banned(self, html: str, status_code: int) -> tuple[bool, str]:
+        if status_code in (403, 429):
+            return True, f"http_{status_code}"
+        if status_code >= 500:
+            return True, f"http_{status_code}"
+        text = (html or "").strip().lower()
+        is_xml_payload = text.startswith("<?xml") or "<urlset" in text or "<sitemapindex" in text
+        is_html_payload = "<html" in text or "<!doctype html" in text
+        if is_html_payload and not is_xml_payload:
+            markers = (
+                "just a moment",
+                "checking your browser",
+                "cf-browser-verification",
+                "attention required! | cloudflare",
+                "ddos protection by",
+            )
+            if any(m in text[:20000] for m in markers):
+                return True, "bot_challenge"
+        return False, ""
+
+    async def dynamic_backoff(self, attempt_number: int = 1) -> None:
+        attempt = max(1, int(attempt_number))
+        delay = min(30.0, (2 ** attempt) + random.uniform(0.5, 2.0))
+        await asyncio.sleep(delay)
+
+
+# كائن متوافق يُستورد من المحركات القديمة والجديدة
+stealth_manager = _StealthManagerCompat()
