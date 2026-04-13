@@ -4,6 +4,8 @@ import logging
 import urllib.parse
 from bs4 import BeautifulSoup, FeatureNotFound
 from typing import List, Set
+
+from engines.sitemap_resolve import _fetch_via_zenrows_no_js
 from scrapers.anti_ban import stealth_manager
 
 logger = logging.getLogger(__name__)
@@ -51,16 +53,23 @@ class SitemapResolver:
             await stealth_manager.apply_smart_delay(1.5, 4.0)
 
             async with session.get(sitemap_url, headers=headers, timeout=20) as response:
-                # ── حارس 403 / 401: حظر صريح من الخادم ────────────────────
                 if response.status in (401, 403):
                     logger.warning(
-                        "[Sitemap] HTTP %s (ban/forbidden) on %s — skipping gracefully",
+                        "[Sitemap] HTTP %s on %s — trying ZenRows fallback",
                         response.status, sitemap_url,
                     )
-                    return []
-
-                # ── قراءة المحتوى مرة واحدة فقط (aiohttp يسمح بقراءة واحدة) ──
-                html_content = await response.text(errors="ignore")
+                    zt = await asyncio.to_thread(
+                        _fetch_via_zenrows_no_js, sitemap_url, 45.0
+                    )
+                    if not zt:
+                        logger.warning(
+                            "[Sitemap] ZenRows failed for %s — skipping",
+                            sitemap_url,
+                        )
+                        return []
+                    html_content = zt
+                else:
+                    html_content = await response.text(errors="ignore")
 
                 is_banned, ban_msg = stealth_manager.is_shadow_banned(html_content, response.status)
 
