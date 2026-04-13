@@ -33,6 +33,48 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
 
+
+def _zenrows_api_key_for_sitemap() -> str:
+    try:
+        from config import ZENROWS_API_KEY
+
+        return (ZENROWS_API_KEY or "").strip()
+    except ImportError:
+        import os
+
+        return os.environ.get("ZENROWS_API_KEY", "").strip()
+
+
+def _fetch_via_zenrows_no_js(target_url: str, timeout: float = 45.0) -> Optional[str]:
+    """
+    ZenRows Web Unlocker بدون js_render — مناسب لـ XML/sitemap وتقليل استهلاك الاعتمادات.
+    يُستورد من scrapers.sitemap_resolve عند الحاجة.
+    """
+    key = _zenrows_api_key_for_sitemap()
+    if not key or not target_url.startswith("http"):
+        return None
+    try:
+        import requests
+
+        resp = requests.get(
+            "https://api.zenrows.com/v1/",
+            params={
+                "apikey": key,
+                "url": target_url,
+                "premium_proxy": "true",
+            },
+            timeout=timeout,
+        )
+        if resp.status_code == 200 and (resp.text or "").strip():
+            logger.info("ZenRows (no-js) OK for %s", target_url[:80])
+            return resp.text
+        logger.warning(
+            "ZenRows (no-js) HTTP %s for %s", resp.status_code, target_url[:80]
+        )
+    except Exception as exc:
+        logger.warning("ZenRows (no-js) error for %s: %s", target_url[:80], exc)
+    return None
+
 # ══════════════════════════════════════════════════════════════════════════
 #  ثوابت ومسارات Sitemap
 # ══════════════════════════════════════════════════════════════════════════
@@ -128,7 +170,8 @@ def _is_zid(url: str) -> bool:
 async def _fetch_xml(
     session: aiohttp.ClientSession, url: str
 ) -> Optional[str]:
-    """GET مع رؤوس XML وتجاهل TLS — يُرجع نص XML أو None."""
+    """GET مع رؤوس XML وتجاهل TLS — يُرجع نص XML أو None. عند 401/403 يُجرّب ZenRows."""
+    forbidden = False
     try:
         async with session.get(
             url,
@@ -142,14 +185,19 @@ async def _fetch_xml(
                 if "xml" in ct or "text" in ct or url.endswith(".xml"):
                     return await resp.text(errors="ignore")
             elif resp.status in (401, 403):
+                forbidden = True
                 logger.warning(
-                    "_fetch_xml %s → HTTP %s (ban/forbidden) — returning None gracefully",
+                    "_fetch_xml %s → HTTP %s — trying ZenRows fallback",
                     url, resp.status,
                 )
             else:
                 logger.debug("_fetch_xml %s → HTTP %s", url, resp.status)
     except Exception as exc:
         logger.debug("_fetch_xml %s → %s", url, exc)
+    if forbidden:
+        ztxt = await asyncio.to_thread(_fetch_via_zenrows_no_js, url, 45.0)
+        if ztxt:
+            return ztxt
     return None
 
 
@@ -215,6 +263,8 @@ async def resolve_sitemap_recursively(
     if current_depth > max_depth:
         return set()
     try:
+        content: Optional[bytes] = None
+        http_status = 0
         async with session.get(
             sitemap_url,
             headers=get_xml_headers(),
@@ -222,58 +272,69 @@ async def resolve_sitemap_recursively(
             allow_redirects=True,
             timeout=30,
         ) as response:
-            if response.status in (401, 403):
+            http_status = response.status
+            if response.status == 200:
+                content = await response.read()
+            elif response.status in (401, 403):
                 logger.warning(
-                    "resolve_sitemap_recursively %s → HTTP %s (ban/forbidden) — skipping gracefully",
+                    "resolve_sitemap_recursively %s → HTTP %s — trying ZenRows",
                     sitemap_url, response.status,
                 )
-                return set()
-            if response.status != 200:
+                ztxt = await asyncio.to_thread(
+                    _fetch_via_zenrows_no_js, sitemap_url, 45.0
+                )
+                if ztxt:
+                    content = ztxt.encode("utf-8", errors="replace")
+            else:
                 logger.debug(
                     "resolve_sitemap_recursively %s → HTTP %s",
                     sitemap_url, response.status,
                 )
-                return set()
-            content = await response.read()
-            root = ET.fromstring(content)
 
-            # FIX: Deep Sitemap & AI Fallback Integrated
-            # إزالة Namespaces لتسهيل البحث الآمن عبر جميع القوالب.
-            for elem in root.iter():
-                if "}" in elem.tag:
-                    elem.tag = elem.tag.split("}", 1)[1]
+        if not content:
+            if http_status in (401, 403):
+                logger.warning(
+                    "resolve_sitemap_recursively %s → ZenRows yielded no usable XML",
+                    sitemap_url,
+                )
+            return set()
 
-            urls: set[str] = set()
-            if root.tag == "sitemapindex":
-                # FIX: Deep Sitemap & AI Fallback Integrated
-                # تتبع sitemapindex المتداخل بالتوازي الكامل.
-                tasks = []
-                for loc in root.findall(".//loc"):
-                    if loc.text:
-                        tasks.append(
-                            resolve_sitemap_recursively(
-                                session,
-                                loc.text.strip(),
-                                max_depth,
-                                current_depth + 1,
-                            )
+        root = ET.fromstring(content)
+
+        # إزالة Namespaces لتسهيل البحث الآمن عبر جميع القوالب.
+        for elem in root.iter():
+            if "}" in elem.tag:
+                elem.tag = elem.tag.split("}", 1)[1]
+
+        urls: set[str] = set()
+        if root.tag == "sitemapindex":
+            tasks = []
+            for loc in root.findall(".//loc"):
+                if loc.text:
+                    tasks.append(
+                        resolve_sitemap_recursively(
+                            session,
+                            loc.text.strip(),
+                            max_depth,
+                            current_depth + 1,
                         )
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for res in results:
-                    if isinstance(res, set):
-                        urls.update(res)
-            elif root.tag == "urlset":
-                for loc in root.findall(".//loc"):
-                    if not loc.text:
-                        continue
-                    loc_text = loc.text.strip()
-                    if (
-                        "/p/" in loc_text
-                        or "-p" in loc_text
-                        or "product" in loc_text.lower()
-                    ):
-                        urls.add(loc_text)
-            return urls
+                    )
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, set):
+                    urls.update(res)
+        elif root.tag == "urlset":
+            for loc in root.findall(".//loc"):
+                if not loc.text:
+                    continue
+                loc_text = loc.text.strip()
+                if (
+                    "/p/" in loc_text
+                    or "-p" in loc_text
+                    or "product" in loc_text.lower()
+                ):
+                    urls.add(loc_text)
+        return urls
     except Exception as exc:
         logger.debug("resolve_sitemap_recursively failed for %s: %s", sitemap_url, exc)
         return set()
@@ -623,9 +684,16 @@ def resolve_store_to_sitemap_url(user_input: str) -> Tuple[Optional[str], str]:
     def _probe(url: str) -> bool:
         try:
             r = _req.get(url, headers=get_xml_headers(), timeout=20, allow_redirects=True)
-            if r.status_code != 200:
+            body = ""
+            if r.status_code == 200:
+                body = r.text
+            elif r.status_code in (401, 403):
+                body = _fetch_via_zenrows_no_js(url, 45.0) or ""
+            else:
                 return False
-            t = r.text.lstrip()[:2000]
+            if not body:
+                return False
+            t = body.lstrip()[:2000]
             return bool(re.search(r"<(?:urlset|sitemapindex)\b", t, re.I))
         except Exception:
             return False
@@ -643,8 +711,13 @@ def resolve_store_to_sitemap_url(user_input: str) -> Tuple[Optional[str], str]:
             timeout=15,
             allow_redirects=True,
         )
+        robots_text = ""
         if r.status_code == 200:
-            for line in r.text.splitlines():
+            robots_text = r.text
+        elif r.status_code in (401, 403):
+            robots_text = _fetch_via_zenrows_no_js(f"{base}/robots.txt", 45.0) or ""
+        if robots_text:
+            for line in robots_text.splitlines():
                 if line.strip().lower().startswith("sitemap:"):
                     u = line.split(":", 1)[1].strip()
                     if u.startswith("http") and _probe(u):
