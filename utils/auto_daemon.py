@@ -277,7 +277,7 @@ def run_worker_loop() -> None:
             state = read_state()
             urls_total = len(urls)
             state["products_total"] = int(state.get("products_total", 0)) + urls_total
-            state["message"] = f"scraping {comp['name']} ({urls_total} products)"
+            state["message"] = f"جاري الكشط: {comp['name']} — {urls_total} رابط منتج"
             state = _mark_store_state(state, i, status="running", products_total=urls_total, products_done=0)
             _write_json(STATE_FILE, state)
 
@@ -308,6 +308,8 @@ def run_worker_loop() -> None:
                         save_results_to_db([final_res])
                         if final_res.success:
                             store_success += 1
+                            # تصدير فوري لـ CSV حتى تظهر الأعداد الحية في لوحة التحكم
+                            _refresh_output_csv_from_db()
                         else:
                             store_errors += 1
                             state = read_state()
@@ -331,8 +333,11 @@ def run_worker_loop() -> None:
                         success_count=store_success,
                         error_count=store_errors,
                     )
-                    state["message"] = f"{comp['name']} {idx}/{len(urls)}"
+                    state["message"] = f"{idx}/{len(urls)} · {comp['name']}"
                     _write_json(STATE_FILE, state)
+                    # نسخ احتياطي للملف كل 15 منتجًا (نجاح أو فشل) لتقليل التخلف عن قاعدة البيانات
+                    if idx % 15 == 0:
+                        _refresh_output_csv_from_db()
                     time.sleep(STRICT_DELAY_SECONDS)
 
             state = read_state()
