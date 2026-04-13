@@ -141,7 +141,13 @@ async def _fetch_xml(
                 ct = (resp.headers.get("Content-Type") or "").lower()
                 if "xml" in ct or "text" in ct or url.endswith(".xml"):
                     return await resp.text(errors="ignore")
-            logger.debug("_fetch_xml %s → HTTP %s", url, resp.status)
+            elif resp.status in (401, 403):
+                logger.warning(
+                    "_fetch_xml %s → HTTP %s (ban/forbidden) — returning None gracefully",
+                    url, resp.status,
+                )
+            else:
+                logger.debug("_fetch_xml %s → HTTP %s", url, resp.status)
     except Exception as exc:
         logger.debug("_fetch_xml %s → %s", url, exc)
     return None
@@ -216,7 +222,17 @@ async def resolve_sitemap_recursively(
             allow_redirects=True,
             timeout=30,
         ) as response:
+            if response.status in (401, 403):
+                logger.warning(
+                    "resolve_sitemap_recursively %s → HTTP %s (ban/forbidden) — skipping gracefully",
+                    sitemap_url, response.status,
+                )
+                return set()
             if response.status != 200:
+                logger.debug(
+                    "resolve_sitemap_recursively %s → HTTP %s",
+                    sitemap_url, response.status,
+                )
                 return set()
             content = await response.read()
             root = ET.fromstring(content)
