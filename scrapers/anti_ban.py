@@ -18,6 +18,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import aiohttp
+import os
 
 # تجاهل تحذيرات SSL المزعجة في الـ Terminal لتنظيف الـ Logs
 import urllib3
@@ -187,11 +188,19 @@ async def fetch_with_retry(
     domain = urlparse(url).netloc
     rl = get_rate_limiter()
 
+    proxy = get_proxy()
     for attempt in range(max_retries):
         headers = get_browser_headers(referer=referer or f"https://{domain}/")
         try:
             await rl.wait(domain)
-            resp = await session.get(url, headers=headers, ssl=False, allow_redirects=True)
+            # تمرير البروكسي لـ aiohttp إذا وجد
+            resp = await session.get(
+                url, 
+                headers=headers, 
+                ssl=False, 
+                allow_redirects=True,
+                proxy=proxy
+            )
 
             if resp.status == 200:
                 rl.record_success(domain)
@@ -231,6 +240,11 @@ _SESSION_LOCK = threading.Lock()
 _CFFI_SESSION = None
 _CLOUD_SCRAPER = None
 _REQ_SESSION = None
+
+def get_proxy() -> Optional[str]:
+    """يجلب البروكسي من متغيرات البيئة (SCRAPER_PROXY أو HTTP_PROXY)."""
+    proxy = os.environ.get("SCRAPER_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    return proxy.strip() if proxy else None
 
 def _get_cffi_session():
     global _CFFI_SESSION
@@ -275,10 +289,16 @@ def try_curl_cffi(url: str, timeout: int = 25) -> Optional[str]:
     session = _get_cffi_session()
     if session is None:
         return None
+    proxy = get_proxy()
     try:
-        resp = session.get(url, timeout=timeout, allow_redirects=True)
-        if resp.status_code == 200:
-            return resp.text
+        resp = session.get(
+            url, 
+            timeout=timeout, 
+            allow_redirects=True,
+            proxy=proxy
+        )
+        return resp.text
+    except Exception as exc:n resp.text
     except Exception as exc:
         logger.debug("curl_cffi %s: %s", url, type(exc).__name__)
     return None
@@ -291,8 +311,10 @@ def try_cloudscraper(url: str, timeout: int = 25) -> Optional[str]:
     scraper = _get_cloudscraper()
     if scraper is None:
         return None
+    proxy = get_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        resp = scraper.get(url, timeout=timeout)
+        resp = scraper.get(url, timeout=timeout, proxies=proxies)
         if resp.status_code == 200:
             return resp.text
     except Exception as exc:
@@ -322,7 +344,16 @@ def try_all_sync_fallbacks(url: str, timeout: int = 25) -> Optional[str]:
     try:
         headers = get_browser_headers(referer=f"https://{urlparse(url).netloc}/")
         session = _get_req_session()
-        resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True, verify=False)
+        proxy = get_proxy()
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = session.get(
+            url, 
+            headers=headers, 
+            timeout=timeout, 
+            allow_redirects=True, 
+            verify=False,
+            proxies=proxies
+        )
         
         if resp.status_code == 200:
             if not looks_like_bot_challenge(resp.text):

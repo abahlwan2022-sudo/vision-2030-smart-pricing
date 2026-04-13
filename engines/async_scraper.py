@@ -423,9 +423,11 @@ async def fetch_product(
     async with semaphore:
         # ── Shopify-style .json ──────────────────────────────────────────
         json_url = url if url.endswith(".json") else url.rstrip("/") + ".json"
+        proxy = _get_browser_headers.__globals__.get("get_proxy")() if _ANTI_BAN_AVAILABLE else None
         try:
             async with session.get(
-                json_url, timeout=aiohttp.ClientTimeout(total=12), ssl=False
+                json_url, timeout=aiohttp.ClientTimeout(total=12), ssl=False,
+                proxy=proxy
             ) as resp:
                 if resp.status == 200 and "json" in resp.headers.get("Content-Type", ""):
                     data = await resp.json(content_type=None)
@@ -451,6 +453,7 @@ async def fetch_product(
             async with session.get(
                 url, timeout=aiohttp.ClientTimeout(total=18),
                 headers=hdrs, ssl=False, allow_redirects=True,
+                proxy=proxy
             ) as resp:
                 if resp.status == 200:
                     html = await resp.text(errors="replace")
