@@ -97,6 +97,11 @@ OPENROUTER_API_KEY = _s("OPENROUTER_API_KEY") or _s("OPENROUTER_KEY") or ""
 COHERE_API_KEY     = _s("COHERE_API_KEY") or ""
 EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 
+# ZenRows — وكيل جلب للصفحات خلف Cloudflare / تحديات البوت (اختياري)
+# عيّن ZENROWS_API_KEY في البيئة أو Streamlit secrets؛ لا تضع المفتاح في الكود.
+ZENROWS_API_KEY = (_s("ZENROWS_API_KEY") or "").strip()
+ZENROWS_MODE = (_s("ZENROWS_MODE", "auto") or "auto").strip() or "auto"
+
 
 def any_ai_provider_configured() -> bool:
     """
